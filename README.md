@@ -82,6 +82,8 @@ For certificate issuance, these records must point to the correct server and por
 
 ## Quick Start
 
+<img src="imgs/mainframe.png" alt="Mainframe" width="800">
+
 Download the installer and run it as root:
 
 ```bash
