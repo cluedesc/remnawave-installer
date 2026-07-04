@@ -1,6 +1,6 @@
-# RemnawaveInstaller
+# Remnawave Installer
 
-**RemnawaveInstaller** is an open-source installer and operations menu for building a Remnawave stack without hand-assembling every service, proxy rule, certificate, and node connection yourself.
+**Remnawave Installer** is an open-source installer and operations menu for building a Remnawave stack without hand-assembling every service, proxy rule, certificate, and node connection yourself.
 
 It is designed for clean VPS deployments where you want to go from an empty server to a working Remnawave setup with a guided flow, then keep the same tool around for maintenance.
 
@@ -17,7 +17,7 @@ The project helps deploy and manage:
 - optional native WARP routing
 - creator support information
 
-Instead of being a one-time script that disappears after installation, **RemnawaveInstaller** behaves like a small server console. You can install, update, restart, inspect logs, reconfigure the subscription page, work with certificates, and manage nodes from the same menu.
+Instead of being a one-time script that disappears after installation, **Remnawave Installer** behaves like a small server console. You can install, update, restart, inspect logs, reconfigure the subscription page, work with certificates, and manage nodes from the same menu.
 
 ## Supported Systems
 
@@ -183,7 +183,7 @@ Support options:
 
 ## What Makes It Different
 
-**RemnawaveInstaller** focuses on the whole operator experience, not only the first install.
+**Remnawave Installer** focuses on the whole operator experience, not only the first install.
 
 It keeps the common tasks close:
 
