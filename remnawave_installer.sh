@@ -30,8 +30,10 @@ PANEL_AUTH_TOKEN=""
 PANEL_AUTH_USERNAME=""
 PANEL_AUTH_PASSWORD=""
 
-PANEL_COMPOSE_URL="https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/docker-compose-prod.yml"
-PANEL_ENV_URL="https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/.env.sample"
+# Keep both templates on the same v3 release; the compose image stays on :3.
+PANEL_TEMPLATE_VERSION="3.4.4"
+PANEL_COMPOSE_URL="https://raw.githubusercontent.com/remnawave/backend/${PANEL_TEMPLATE_VERSION}/docker-compose-prod.yml"
+PANEL_ENV_URL="https://raw.githubusercontent.com/remnawave/backend/${PANEL_TEMPLATE_VERSION}/.env.sample"
 
 CERTBOT_RENEW_CRON="# remnawave-installer certbot renew"
 
@@ -528,6 +530,9 @@ set_env_value() {
   if grep -q "^${key}=" "$file"; then
     sed -i "s/^${key}=.*/${key}=${escaped}/" "$file"
   else
+    if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+      printf '\n' >> "$file"
+    fi
     printf '%s=%s\n' "$key" "$value" >> "$file"
   fi
 }
@@ -789,68 +794,196 @@ check_domain_dns() {
 # BACKUP_RESTORE BEGIN
 
 backup_path() {
-  local path="$1"
-  local name="$2"
-
-  local dest="${BACKUP_ROOT}/${name}-$(date +%Y%m%d%H%M%S)"
-
+  local path="$1" name="$2" dest
+  dest="${BACKUP_ROOT}/${name}-$(date +%Y%m%d%H%M%S)"
   if [ -e "$path" ]; then
-    mkdir -p "$dest"
-
-    cp -a "$path" "$dest/"
-
+    mkdir -p "$dest" && chmod 700 "$dest" && cp -a "$path" "$dest/" || return 1
     ok "Backup: ${path} -> ${dest}/"
   fi
 }
 
+backup_compose() (
+  local dir="$1"
+  shift
+  cd "$dir" || return 1
+  local files=(-f docker-compose.yml)
+  [ ! -f docker-compose.subscription.yml ] || files+=(-f docker-compose.subscription.yml)
+  docker compose "${files[@]}" "$@"
+)
+
+backup_wait_database() {
+  local attempt
+  for attempt in {1..30}; do
+    if backup_compose "$PANEL_DIR" exec -T remnawave-db sh -c \
+      'pg_isready -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}"' >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  warn "Database did not become ready."
+  return 1
+}
+
 backup_panel() {
-  backup_path "$PANEL_DIR/.env" "panel-env"
-  backup_path "$PANEL_DIR/docker-compose.yml" "panel-compose"
+  backup_all
 }
 
 backup_node() {
-  backup_path "$NODE_DIR/docker-compose.yml" "node-compose"
+  backup_path "$NODE_DIR/docker-compose.yml" "node-compose" || return 1
   backup_path "$NODE_DIR/.env" "node-env"
 }
 
-backup_all() {
-  local archive="${BACKUP_ROOT}/remnawave-backup-$(date +%Y%m%d%H%M%S).tar.gz"
-
-  mkdir -p "$BACKUP_ROOT"
-
-  tar -czf "$archive" \
-    --ignore-failed-read \
-    "$PANEL_DIR" \
-    "$NODE_DIR" \
-    "$STATE_DIR" \
-    /etc/caddy/Caddyfile \
-    /etc/nginx/conf.d/remnawave-panel.conf \
-    2>/dev/null || true
-
-  chmod 600 "$archive"
-
-  ok "Backup archive: ${archive}"
-}
-
-restore_backup() {
-  local archive
-
-  ask_required "Backup .tar.gz path" archive
-
-  [ -f "$archive" ] || die "Backup was not found: ${archive}"
-
-  warn "Restore will extract the backup into the filesystem root."
-
-  if ! confirm "Continue restore?"; then
-    warn "Restore cancelled by user."
-
-    return 0
+backup_all() (
+  umask 077
+  mkdir -p "$BACKUP_ROOT" || return 1
+  local stage archive path running_services has_panel=0 started_database=0
+  stage="$(mktemp -d "${BACKUP_ROOT}/.backup.XXXXXX")" || return 1
+  backup_release_database() {
+    if [ "$started_database" = 1 ]; then
+      backup_compose "$PANEL_DIR" stop remnawave-db || {
+        warn "Could not return the database to its stopped state."; return 1;
+      }
+      started_database=0
+    fi
+  }
+  backup_cleanup() {
+    local status="$1"
+    backup_release_database || status=1
+    rm -rf -- "$stage" || status=1
+    exit "$status"
+  }
+  trap 'backup_cleanup $?' EXIT
+  archive="${BACKUP_ROOT}/remnawave-backup-$(date +%Y%m%d%H%M%S)-${stage##*.}.tar.gz"
+  local paths=()
+  for path in "$PANEL_DIR" "$NODE_DIR" "$STATE_DIR" /etc/caddy/Caddyfile /etc/nginx/conf.d/remnawave-panel.conf /etc/nginx/conf.d/remnawave-subscription-page.conf; do
+    [ ! -e "$path" ] || paths+=("${path#/}")
+  done
+  [ "${#paths[@]}" -gt 0 ] || { warn "Nothing to back up."; return 1; }
+  if [ -d "$PANEL_DIR" ]; then
+    [ -f "$PANEL_DIR/.env" ] && [ -f "$PANEL_DIR/docker-compose.yml" ] || {
+      warn "Panel configuration is incomplete; backup aborted."; return 1;
+    }
+    running_services="$(backup_compose "$PANEL_DIR" ps --status running --services)" || return 1
+    if ! grep -Fxq remnawave-db <<< "$running_services"; then
+      # Start only PostgreSQL; never start application writers to make a backup.
+      started_database=1
+      backup_compose "$PANEL_DIR" up -d --no-deps remnawave-db || return 1
+    fi
+    backup_wait_database || return 1
+    # pg_dump uses one consistent PostgreSQL snapshot; keep binary stdout untouched.
+    backup_compose "$PANEL_DIR" exec -T remnawave-db sh -c \
+      'exec pg_dump -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}" --format=custom --create' \
+      > "$stage/database.dump" || { warn "Database dump failed; no backup created."; return 1; }
+    [ -s "$stage/database.dump" ] || return 1
+    has_panel=1
   fi
+  printf 'remnawave-v3-backup-1\npanel=%s\n' "$has_panel" > "$stage/manifest"
+  tar -czf "$stage/files.tar.gz" -C / -- "${paths[@]}" || {
+    warn "Configuration archive failed; no backup created."; return 1;
+  }
+  backup_validate_files "$stage/files.tar.gz" "$stage" || {
+    warn "Configuration contains unsupported links or paths; no backup created."; return 1;
+  }
+  local members=(manifest files.tar.gz)
+  [ "$has_panel" = 0 ] || members+=(database.dump)
+  tar -czf "$stage/archive.tar.gz" -C "$stage" -- "${members[@]}" || return 1
+  backup_release_database || return 1
+  mv -- "$stage/archive.tar.gz" "$archive" || return 1
+  ok "Backup archive: ${archive}"
+)
 
-  tar -xzf "$archive" -C /
-
-  ok "Backup restored. Check services and restart compose if required."
+# Only regular files and directories under our configuration roots are restorable.
+# Reject links and traversal before extraction, including links in live parent paths.
+backup_validate_files() {
+  local archive="$1" name root allowed component current
+  tar -tzf "$archive" > "$2/names" && tar -tvzf "$archive" > "$2/types" || return 1
+  while IFS= read -r name; do
+    case "${name:0:1}" in -|d) ;; *) return 1 ;; esac
+  done < "$2/types"
+  while IFS= read -r name; do
+    case "$name" in ''|/*|*\\*|../*|*/../*|*/..|./*|*/./*) return 1 ;; esac
+    allowed=0
+    for root in "${PANEL_DIR#/}" "${NODE_DIR#/}" "${STATE_DIR#/}"; do
+      case "$name" in "$root"|"$root/"*) allowed=1 ;; esac
+    done
+    case "$name" in etc/caddy/Caddyfile|etc/nginx/conf.d/remnawave-panel.conf|etc/nginx/conf.d/remnawave-subscription-page.conf) allowed=1 ;; esac
+    [ "$allowed" = 1 ] || return 1
+    current=""
+    local components=()
+    IFS=/ read -r -a components <<< "$name"
+    for component in "${components[@]}"; do
+      current="$current/$component"
+      [ ! -L "$current" ] || return 1
+    done
+  done < "$2/names"
 }
+
+restore_backup() (
+  local archive stage name has_panel
+  ask_required "Backup .tar.gz path" archive
+  [ -f "$archive" ] || { warn "Backup was not found: ${archive}"; return 1; }
+  umask 077
+  stage="$(mktemp -d)" || return 1
+  trap 'rm -rf -- "$stage"' EXIT
+  tar -tzf "$archive" > "$stage/members" && tar -tvzf "$archive" > "$stage/types" || return 1
+  while IFS= read -r name; do
+    case "$name" in manifest|files.tar.gz|database.dump) ;; *) warn "Unsupported or unsafe backup."; return 1 ;; esac
+  done < "$stage/members"
+  while IFS= read -r name; do
+    [ "${name:0:1}" = - ] || return 1
+  done < "$stage/types"
+  [ "$(sort "$stage/members" | uniq -d | wc -l)" -eq 0 ] || return 1
+  tar -xzf "$archive" -C "$stage" --no-same-owner || return 1
+  case "$(cat "$stage/manifest")" in
+    $'remnawave-v3-backup-1\npanel=1') has_panel=1 ;;
+    $'remnawave-v3-backup-1\npanel=0') has_panel=0 ;;
+    *) warn "Unsupported backup format; a complete V3 backup is required."; return 1 ;;
+  esac
+  backup_validate_files "$stage/files.tar.gz" "$stage" || { warn "Unsafe configuration archive."; return 1; }
+  if [ "$has_panel" = 1 ]; then
+    grep -Fxq "${PANEL_DIR#/}/.env" "$stage/names" &&
+      grep -Fxq "${PANEL_DIR#/}/docker-compose.yml" "$stage/names" &&
+      [ -s "$stage/database.dump" ] || return 1
+    # Resolve the saved DB image without starting the stack or mounting its data.
+    # This also works when the old installation is stopped or no longer exists.
+    mkdir "$stage/config" || return 1
+    tar -xzf "$stage/files.tar.gz" -C "$stage/config" --no-same-owner || return 1
+    local database_image
+    database_image="$(backup_compose "$stage/config/${PANEL_DIR#/}" config --format json |
+      jq -er '.services["remnawave-db"].image | select(type == "string" and length > 0)')" || return 1
+    # No implicit pull before confirmation: use the saved PostgreSQL image locally.
+    docker run --rm -i --pull=never --network none --entrypoint pg_restore "$database_image" --list \
+      < "$stage/database.dump" >/dev/null || {
+        warn "Dump validation failed. Ensure the saved database image is available locally: ${database_image}"; return 1;
+      }
+  elif grep -Eq "^${PANEL_DIR#/}(/|$)" "$stage/names"; then
+    warn "Panel restore requires a database dump."; return 1
+  fi
+  warn "Restore replaces saved configuration and the Panel database. A failed restore leaves services stopped."
+  confirm "Continue restore?" || { warn "Restore cancelled by user."; return 0; }
+  # Stop all writers using the CURRENT compose before replacing it.
+  if [ -f "$NODE_DIR/docker-compose.yml" ]; then
+    backup_compose "$NODE_DIR" stop || return 1
+  fi
+  if [ "$has_panel" = 1 ] && [ -f "$PANEL_DIR/docker-compose.yml" ]; then
+    backup_compose "$PANEL_DIR" stop || return 1
+  fi
+  if [ "$has_panel" = 1 ] && ! grep -Fxq "${PANEL_DIR#/}/docker-compose.subscription.yml" "$stage/names"; then
+    rm -f -- "$PANEL_DIR/docker-compose.subscription.yml" || return 1
+  fi
+  tar -xzf "$stage/files.tar.gz" -C / --no-same-owner || return 1
+  if [ "$has_panel" = 1 ]; then
+    backup_compose "$PANEL_DIR" up -d --no-deps remnawave-db || return 1
+    backup_wait_database || return 1
+    # Recreate the database, removing tables introduced after this backup as well.
+    backup_compose "$PANEL_DIR" exec -T remnawave-db sh -c \
+      'exec pg_restore -U "${POSTGRES_USER:-postgres}" --dbname=template1 --clean --if-exists --create --exit-on-error' \
+      < "$stage/database.dump" || { warn "Database restore failed; services remain stopped."; return 1; }
+    start_panel_stack || return 1
+  fi
+  if [ -f "$NODE_DIR/docker-compose.yml" ]; then
+    backup_compose "$NODE_DIR" up -d || return 1
+  fi
+  ok "Backup restored."
+)
 
 # BACKUP_RESTORE END
 
@@ -1465,7 +1598,9 @@ http_status_code() {
   local timeout="${2:-$HTTP_CHECK_TIMEOUT}"
   local status
 
-  status="$(curl -k -sS -o /dev/null -w '%{http_code}' --connect-timeout "$timeout" --max-time "$timeout" "$url" 2>/dev/null || true)"
+  shift
+  if [ "$#" -gt 0 ]; then shift; fi
+  status="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$timeout" --max-time "$timeout" "$@" "$url" 2>/dev/null)" || status="000"
 
   case "$status" in
     [0-9][0-9][0-9]) printf '%s' "$status" ;;
@@ -1475,7 +1610,7 @@ http_status_code() {
 
 is_http_ready_status() {
   case "$1" in
-    2??|3??|4??) return 0 ;;
+    200) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1501,26 +1636,27 @@ wait_for_http_status() {
   local spinner_index=0
   local spinner='-\|/'
   local frame
-  local status="000"
+  local response_status="000"
+  shift 6
 
   started_at="$(date +%s)"
 
   while true; do
-    status="$(http_status_code "$url")"
+    response_status="$(http_status_code "$url" "$HTTP_CHECK_TIMEOUT" "$@")"
 
     case "$mode" in
       ready)
-        if is_http_ready_status "$status"; then
+        if is_http_ready_status "$response_status"; then
           clear_wait_line
-          printf -v "$status_var" '%s' "$status"
+          printf -v "$status_var" '%s' "$response_status"
 
           return 0
         fi
         ;;
       success)
-        if is_http_success_status "$status"; then
+        if is_http_success_status "$response_status"; then
           clear_wait_line
-          printf -v "$status_var" '%s' "$status"
+          printf -v "$status_var" '%s' "$response_status"
 
           return 0
         fi
@@ -1537,13 +1673,13 @@ wait_for_http_status() {
     frame="${spinner:$((spinner_index % 4)):1}"
     spinner_index=$((spinner_index + 1))
 
-    printf "\r%s %s (%ss elapsed, last HTTP %s)" "$frame" "$label" "$elapsed" "$status"
+    printf "\r%s %s (%ss elapsed, last HTTP %s)" "$frame" "$label" "$elapsed" "$response_status"
 
     sleep "$WAIT_REFRESH_INTERVAL"
   done
 
   clear_wait_line
-  printf -v "$status_var" '%s' "$status"
+  printf -v "$status_var" '%s' "$response_status"
 
   return 1
 }
@@ -1558,22 +1694,23 @@ check_panel_url() {
   local status
 
   if [ "$webserver" = "none" ]; then
-    if wait_for_http_status "Checking local Panel URL http://127.0.0.1:3000" "http://127.0.0.1:3000" ready 5 1 status; then
+    if wait_for_http_status "Checking local Panel API" "http://127.0.0.1:3000/api/auth/status" ready "$attempts" "$delay" status -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-For: 127.0.0.1'; then
       ok "Local Panel check passed: http://127.0.0.1:3000 (${status})"
+      return 0
     else
       warn "Local Panel check failed: http://127.0.0.1:3000 (last HTTP ${status})."
+      return 1
     fi
-
-    return 0
   fi
 
-  if wait_for_http_status "Checking Panel HTTPS https://${panel_domain}" "https://${panel_domain}" success "$attempts" "$delay" status; then
+  if wait_for_http_status "Checking Panel HTTPS API https://${panel_domain}" "https://${panel_domain}/api/auth/status" ready "$attempts" "$delay" status; then
     ok "HTTPS check passed: https://${panel_domain} (${status})"
 
     return 0
   fi
 
   warn "HTTPS check failed for https://${panel_domain} (last HTTP ${status}). Check DNS, firewall, reverse proxy, and logs."
+  return 1
 }
 
 check_subscription_page_url() {
@@ -1584,24 +1721,39 @@ check_subscription_page_url() {
   local delay="${4:-3}"
 
   local status
+  local attempt
+  local healthy=false
+
+  # Upstream restricts health to container loopback without forwarding headers.
+  # The public root is generated by the proxy and cannot prove service health.
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    if docker exec remnawave-subscription-page curl -fsS -o /dev/null \
+      --connect-timeout "$HTTP_CHECK_TIMEOUT" --max-time "$HTTP_CHECK_TIMEOUT" \
+      http://127.0.0.1:3010/internal/health >/dev/null 2>&1; then
+      healthy=true
+      break
+    fi
+    if ((attempt + 1 < attempts)); then sleep "$delay"; fi
+  done
+
+  if [ "$healthy" != true ]; then
+    warn "Subscription page service health check failed. Check its container logs."
+    return 1
+  fi
+  ok "Subscription page internal service health check passed."
 
   if [ "$webserver" = "none" ]; then
-    if wait_for_http_status "Checking local subscription page http://127.0.0.1:3010" "http://127.0.0.1:3010" ready "$attempts" "$delay" status; then
-      ok "Local subscription page check passed: http://127.0.0.1:3010 (${status})"
-    else
-      warn "Local subscription page check failed: http://127.0.0.1:3010 (last HTTP ${status})."
-    fi
-
     return 0
   fi
 
   if wait_for_http_status "Checking subscription page HTTPS https://${subscription_domain}" "https://${subscription_domain}" success "$attempts" "$delay" status; then
-    ok "HTTPS check passed: https://${subscription_domain} (${status})"
+    ok "Public HTTPS certificate and proxy root check passed: https://${subscription_domain} (${status}). Test a real user subscription URL to verify delivery."
 
     return 0
   fi
 
   warn "HTTPS check failed for https://${subscription_domain} (last HTTP ${status}). Check DNS, firewall, reverse proxy, and logs."
+  return 1
 }
 
 get_docker_network_subnet() {
@@ -1865,12 +2017,6 @@ renew_certificates_dry_run() {
 
 # COMPOSE BEGIN
 
-compose_service_exists() {
-  local service="$1"
-
-  docker compose config --services 2>/dev/null | grep -Fxq "$service"
-}
-
 clear_wait_line() {
   printf "\r\033[K"
 }
@@ -1950,15 +2096,32 @@ compose_action() {
   fi
 
   case "$action" in
-    start) run_cmd_stream "Start compose stack in ${dir}" docker compose "${compose_files[@]}" up -d ;;
+    start)
+      if [ "$dir" = "$PANEL_DIR" ]; then
+        start_panel_stack
+      else
+        run_cmd_stream "Start compose stack in ${dir}" docker compose "${compose_files[@]}" up -d
+      fi
+      ;;
     stop) run_cmd_stream "Stop compose stack in ${dir}" docker compose "${compose_files[@]}" down ;;
     restart)
+      if [ "$dir" = "$PANEL_DIR" ]; then
+        validate_panel_v3 || return 1
+      fi
       run_cmd_stream "Stop compose stack in ${dir}" docker compose "${compose_files[@]}" down
-      run_cmd_stream "Start compose stack in ${dir}" docker compose "${compose_files[@]}" up -d
+      if [ "$dir" = "$PANEL_DIR" ]; then
+        start_panel_stack
+      else
+        run_cmd_stream "Start compose stack in ${dir}" docker compose "${compose_files[@]}" up -d
+      fi
       ;;
     update)
-      run_cmd_stream "Pull compose images in ${dir}" docker compose "${compose_files[@]}" pull
-      run_cmd_stream "Start updated compose stack in ${dir}" docker compose "${compose_files[@]}" up -d
+      run_cmd_stream "Pull compose images in ${dir}" docker compose "${compose_files[@]}" pull || return 1
+      if [ "$dir" = "$PANEL_DIR" ]; then
+        start_panel_stack
+      else
+        run_cmd_stream "Start updated compose stack in ${dir}" docker compose "${compose_files[@]}" up -d
+      fi
       ;;
     logs) run_cmd_stream "Follow compose logs in ${dir}" docker compose "${compose_files[@]}" logs -f -t ;;
     status) run_cmd_stream "Show compose status in ${dir}" docker compose "${compose_files[@]}" ps ;;
@@ -1970,46 +2133,45 @@ compose_action() {
 
 # PANEL BEGIN
 
-wait_for_panel_api() {
-  local attempts="${1:-30}"
-  local delay="${2:-3}"
-  local timeout_seconds=$((attempts * delay))
+configure_panel_env() {
+  local file="$1"
+  local panel_domain="$2"
+  local subscription_domain="$3"
+  local pg_pass app_secret metrics_pass webhook_secret
 
-  local started_at
-  local elapsed
-  local spinner_index=0
-  local spinner='-\|/'
-  local frame
-
-  started_at="$(date +%s)"
-
-  while true; do
-    if curl -fsS "http://127.0.0.1:3000/api/auth/status" >/dev/null 2>&1; then
-      clear_wait_line
-
-      ok "Panel API is ready."
-
-      return 0
-    fi
-
-    elapsed=$(($(date +%s) - started_at))
-
-    if [ "$elapsed" -ge "$timeout_seconds" ]; then
-      break
-    fi
-
-    frame="${spinner:$((spinner_index % 4)):1}"
-    spinner_index=$((spinner_index + 1))
-
-    printf "\r%s Waiting for Panel API to respond (%ss elapsed)" "$frame" "$elapsed"
-
-    sleep "$WAIT_REFRESH_INTERVAL"
-  done
-
-  clear_wait_line
-
-  return 1
+  pg_pass="$(random_hex 24)" || return 1
+  app_secret="$(random_hex 64)" || return 1
+  metrics_pass="$(random_hex 64)" || return 1
+  webhook_secret="$(random_hex 32)" || return 1
+  set_env_value "$file" "APP_SECRET" "$app_secret" || return 1
+  set_env_value "$file" "METRICS_PASS" "$metrics_pass" || return 1
+  set_env_value "$file" "WEBHOOK_SECRET_HEADER" "$webhook_secret" || return 1
+  set_env_value "$file" "POSTGRES_USER" "postgres" || return 1
+  set_env_value "$file" "POSTGRES_PASSWORD" "$pg_pass" || return 1
+  set_env_value "$file" "POSTGRES_DB" "postgres" || return 1
+  set_env_value "$file" "DATABASE_URL" "\"postgresql://postgres:${pg_pass}@remnawave-db:5432/postgres\"" || return 1
+  set_env_value "$file" "FRONT_END_DOMAIN" "$panel_domain" || return 1
+  set_env_value "$file" "SUB_PUBLIC_DOMAIN" "$subscription_domain" || return 1
+  set_env_value "$file" "PANEL_DOMAIN" "$panel_domain"
 }
+
+validate_panel_v3() (
+  local config
+  local compose_files=(-f docker-compose.yml)
+
+  cd "$PANEL_DIR" || return 1
+  [ ! -f docker-compose.subscription.yml ] || compose_files+=(-f docker-compose.subscription.yml)
+  config="$(docker compose "${compose_files[@]}" config --format json)" || return 1
+  if ! printf '%s' "$config" | jq -e '
+    .services.remnawave as $panel |
+    ($panel.image | test("^(ghcr.io/)?remnawave/backend:3(\\.[0-9]+){0,2}(@sha256:[a-f0-9]+)?$")) and
+    (($panel.environment.APP_SECRET // "") | length > 0) and
+    ($panel.environment.APP_SECRET != "change_me")
+  ' >/dev/null; then
+    warn "This installer requires Remnawave v3 (backend:3 or a 3.x release) and a configured APP_SECRET."
+    return 1
+  fi
+)
 
 wait_for_panel_database() {
   local attempts="${1:-60}"
@@ -2025,7 +2187,7 @@ wait_for_panel_database() {
   started_at="$(date +%s)"
 
   while true; do
-    if docker compose exec -T remnawave-db pg_isready -U postgres >/dev/null 2>&1; then
+    if docker compose exec -T remnawave-db sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1; then
       clear_wait_line
 
       ok "Postgres is ready."
@@ -2053,62 +2215,38 @@ wait_for_panel_database() {
 }
 
 start_panel_stack() {
-  local webserver="${1:-none}"
+  local recreate="${1:-}"
+  local compose_files=(-f docker-compose.yml)
+  local recreate_args=()
+
+  validate_panel_v3 || return 1
+  cd "$PANEL_DIR" || return 1
+  [ ! -f docker-compose.subscription.yml ] || compose_files+=(-f docker-compose.subscription.yml)
+  [ "$recreate" != "force" ] || recreate_args+=(--force-recreate)
 
   section "Start Panel stack"
-
   step "Starting database and Redis."
-
-  if compose_service_exists remnawave-db && compose_service_exists remnawave-redis; then
-    run_cmd_stream "Start Remnawave database and Redis" docker compose up -d remnawave-db remnawave-redis
-  else
-    run_cmd_stream "Start Remnawave compose stack" docker compose up -d
-  fi
-
-  if compose_service_exists remnawave-db; then
-    wait_for_compose_service_ready remnawave-db 10 10 || return 1
-    wait_for_panel_database 10 10 || return 1
-  fi
-
-  if compose_service_exists remnawave-redis; then
-    wait_for_compose_service_ready remnawave-redis 10 10 || return 1
-  fi
+  run_cmd_stream "Start Remnawave database and Redis" docker compose "${compose_files[@]}" up -d remnawave-db remnawave-redis || return 1
+  wait_for_compose_service_ready remnawave-db 10 10 || return 1
+  wait_for_panel_database 10 10 || return 1
+  wait_for_compose_service_ready remnawave-redis 10 10 || return 1
 
   step "Starting Remnawave backend."
-
-  if compose_service_exists remnawave; then
-    run_cmd_stream "Start Remnawave backend" docker compose up -d remnawave
-  else
-    run_cmd_stream "Start Remnawave compose stack" docker compose up -d
+  run_cmd_stream "Start Remnawave backend" docker compose "${compose_files[@]}" up -d --no-deps "${recreate_args[@]}" remnawave || return 1
+  if ! wait_for_compose_service_ready remnawave 120 5; then
+    warn "Remnawave backend did not become healthy. Check its logs before starting dependent services."
+    return 1
   fi
 
-  if [ "$webserver" != "none" ] && compose_service_exists remnawave; then
-    wait_for_compose_service_ready remnawave 10 10 || return 1
-
-    return 0
+  run_cmd_stream "Start remaining Panel services" docker compose "${compose_files[@]}" up -d || return 1
+  if [ -f docker-compose.subscription.yml ]; then
+    if [ "$recreate" = "force" ]; then
+      run_cmd_stream "Recreate subscription page" docker compose "${compose_files[@]}" up -d --no-deps --force-recreate remnawave-subscription-page || return 1
+    fi
+    check_subscription_page_url "" none || return 1
   fi
 
-  if wait_for_panel_api 5 10; then
-    return 0
-  fi
-
-  warn "Panel API did not respond after first start. Restarting backend and retrying."
-
-  run_cmd "Restart Remnawave backend" docker compose restart remnawave || run_cmd "Restart compose stack" docker compose restart || true
-
-  if wait_for_panel_api 5 10; then
-    ok "Remnawave Panel API is ready after backend restart."
-
-    return 0
-  fi
-
-  if compose_service_exists remnawave && wait_for_compose_service_ready remnawave 5 10; then
-    warn "Remnawave backend is healthy, but direct HTTP API check failed. Continuing because Remnawave v2 requires HTTPS reverse proxy."
-
-    return 0
-  fi
-
-  return 1
+  return 0
 }
 
 create_panel_admin() {
@@ -2290,25 +2428,8 @@ install_panel() {
 
   chmod 600 .env
 
-  set_env_value .env "JWT_AUTH_SECRET" "$(random_hex 64)"
-  set_env_value .env "JWT_API_TOKENS_SECRET" "$(random_hex 64)"
-  set_env_value .env "METRICS_PASS" "$(random_hex 64)"
-  set_env_value .env "WEBHOOK_SECRET_HEADER" "$(random_hex 64)"
-
-  local pg_pass
-
-  pg_pass="$(random_hex 24)"
-
-  set_env_value .env "POSTGRES_PASSWORD" "$pg_pass"
-
-  if grep -q '^DATABASE_URL=' .env; then
-    sed -i "s|^\(DATABASE_URL=\"postgresql://postgres:\)[^\@]*\(@.*\)|\1${pg_pass}\2|" .env
-    sed -i "s|^\(DATABASE_URL=postgresql://postgres:\)[^\@]*\(@.*\)|\1${pg_pass}\2|" .env
-  fi
-
-  set_env_value .env "FRONT_END_DOMAIN" "$panel_domain"
-  set_env_value .env "SUB_PUBLIC_DOMAIN" "$subscription_domain"
-  set_env_value .env "PANEL_DOMAIN" "$panel_domain"
+  configure_panel_env .env "$panel_domain" "$subscription_domain" || die "Failed to configure the Panel environment."
+  validate_panel_v3 || die "Panel configuration is invalid."
 
   note "If reverse proxy configuration fails, containers will remain stopped or partially started in ${PANEL_DIR}."
 
@@ -2319,7 +2440,7 @@ install_panel() {
 
   section "Panel startup"
 
-  if ! start_panel_stack "$webserver"; then
+  if ! start_panel_stack; then
     run_cmd_stream "Show compose status after Panel startup failure" docker compose ps || true
     run_cmd_stream "Show recent Panel logs after startup failure" docker compose logs --tail=80 remnawave remnawave-db remnawave-redis || true
 
@@ -2328,7 +2449,7 @@ install_panel() {
 
   section "Panel access check"
 
-  check_panel_url "$panel_domain" "$webserver"
+  check_panel_url "$panel_domain" "$webserver" || die "Panel access check failed."
 
   ok "Panel installed in ${PANEL_DIR}."
 
@@ -2360,7 +2481,8 @@ install_panel() {
 update_panel() {
   section "Update Remnawave Panel"
 
-  backup_panel
+  validate_panel_v3 || return 1
+  backup_panel || return 1
 
   compose_action "$PANEL_DIR" update
 }
@@ -2368,9 +2490,8 @@ update_panel() {
 reinstall_panel_keep_config() {
   [ -d "$PANEL_DIR" ] || die "Panel is not installed."
 
-  backup_all
-
-  note "Panel reinstall will keep the current .env and Docker volumes."
+  validate_panel_v3 || return 1
+  note "Panel reinstall will keep the current compose files, .env and Docker volumes."
 
   if ! confirm "Continue Panel reinstall?"; then
     warn "Panel reinstall cancelled by user."
@@ -2378,28 +2499,19 @@ reinstall_panel_keep_config() {
     return 0
   fi
 
-  cd "$PANEL_DIR"
+  backup_all || return 1
+  cd "$PANEL_DIR" || return 1
 
   section "Reinstall Remnawave Panel"
 
+  local compose_files=(-f docker-compose.yml)
   if [ -f docker-compose.subscription.yml ]; then
-    run_cmd_stream "Stop Panel compose stack before reinstall" docker compose -f docker-compose.yml -f docker-compose.subscription.yml down --remove-orphans || true
-  else
-    run_cmd_stream "Stop Panel compose stack before reinstall" docker compose down --remove-orphans || true
+    compose_files+=(-f docker-compose.subscription.yml)
   fi
-  cp -a .env ".env.keep.$(date +%Y%m%d%H%M%S)"
+  run_cmd_stream "Pull Panel compose images" docker compose "${compose_files[@]}" pull || return 1
+  start_panel_stack force || return 1
 
-  run_cmd "Download latest Remnawave docker-compose.yml" curl -fsSL "$PANEL_COMPOSE_URL" -o docker-compose.yml
-
-  if [ -f docker-compose.subscription.yml ]; then
-    run_cmd_stream "Pull Panel compose images" docker compose -f docker-compose.yml -f docker-compose.subscription.yml pull
-    run_cmd_stream "Start Panel compose stack" docker compose -f docker-compose.yml -f docker-compose.subscription.yml up -d
-  else
-    run_cmd_stream "Pull Panel compose images" docker compose pull
-    run_cmd_stream "Start Panel compose stack" docker compose up -d
-  fi
-
-  ok "Panel reinstalled with .env and volumes preserved."
+  ok "Panel reinstalled with compose files, .env and volumes preserved."
 }
 
 remove_panel() {
@@ -2511,7 +2623,7 @@ login_panel_and_get_token() {
   local response
   local response_file
   local http_code
-  local api_token
+  local login_access_token
 
   response_file="$(mktemp)"
 
@@ -2529,11 +2641,11 @@ login_panel_and_get_token() {
     die "Panel /api/auth/login returned HTTP ${http_code}: ${response}"
   fi
 
-  api_token=$(printf "%s\n" "$response" | jq -r '.response.accessToken // .accessToken // empty')
+  login_access_token=$(printf "%s\n" "$response" | jq -r '.response.accessToken // empty')
 
-  [ -n "$api_token" ] || die "Panel login succeeded, but accessToken was not returned."
+  [ -n "$login_access_token" ] || die "Panel login succeeded, but accessToken was not returned."
 
-  printf -v "$token_var" '%s' "$api_token"
+  printf -v "$token_var" '%s' "$login_access_token"
 }
 
 get_panel_api_token() {
@@ -2694,14 +2806,28 @@ create_remnawave_node_api() {
 
   created_node_uuid=$(printf "%s\n" "$response" | jq -r '.response.uuid // empty')
 
-  node_secret=$(printf "%s\n" "$response" | jq -r '
-    .response.secretKey //
-    .response.secret_key //
-    .response.secret //
-    .response.node.secretKey //
-    .response.node.secret_key //
-    empty
-  ')
+  node_secret=""
+
+  if [ -n "$secret_var" ]; then
+    # Key access is optional: restricted tokens can create nodes without reading keygen.
+    response_file="$(mktemp)"
+
+    if http_code=$(curl -sS -o "$response_file" -w "%{http_code}" -X GET "${panel_base%/}/api/keygen" \
+      -H "Authorization: Bearer ${token}" \
+      -H "Content-Type: application/json" \
+      -H "X-Forwarded-For: ${panel_base#http://}" \
+      -H "X-Forwarded-Proto: https" \
+      -H "X-Remnawave-Client-Type: browser" 2>/dev/null) &&
+      [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ] &&
+      node_secret=$(jq -er '.response.secretKey | select(type == "string" and length > 0)' "$response_file" 2>/dev/null); then
+      :
+    else
+      node_secret=""
+      warn "Node created, but SECRET_KEY could not be obtained from /api/keygen. Enter it manually from Panel."
+    fi
+
+    rm -f "$response_file"
+  fi
 
   if [ -n "$uuid_var" ]; then
     printf -v "$uuid_var" '%s' "$created_node_uuid"
@@ -4083,4 +4209,6 @@ main() {
 
 # ENTRYPOINT END
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

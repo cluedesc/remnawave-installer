@@ -4,6 +4,8 @@
 
 It is designed for clean VPS deployments where you want to go from an empty server to a working Remnawave setup with a guided flow, then keep the same tool around for maintenance.
 
+The installer targets **Remnawave v3 only**. It does not support v2 or migrate existing v2 installations. New installations use the matching `.env` and Compose templates from release `3.4.4`, with the backend image on the `:3` channel. Updates stay within that major version; explicitly pinned `3.x` image tags remain pinned.
+
 ## Overview
 
 The project helps deploy and manage:
@@ -156,6 +158,22 @@ bash <(curl -Ls https://raw.githubusercontent.com/cluedesc/remnawave-installer/m
 - safe removal modes
 - backup and restore
 
+Panel updates and reinstalls require a successful database backup. Reinstall preserves the existing Compose files, `.env`, and Docker volumes; it does not replace your service configuration with a downloaded template. The database and Redis start first, followed by the backend; dependent services start after the backend becomes healthy.
+
+### Backup and Restore
+
+Full backups contain a PostgreSQL custom-format dump, Panel and Node configuration, the subscription Compose override, installer state, and the managed Caddy/NGINX configuration files. A failed dump or archive operation does not publish a backup. Archives are private and contain credentials: store an off-server copy securely.
+
+If the database is stopped, backup starts only PostgreSQL and returns it to its stopped state afterwards. Application services remain stopped during this operation.
+
+Restore validates the archive and dump before replacing configuration or the database. It stops the existing services, restores the database, and starts the stack only after database restoration succeeds. Failures are reported; do not treat an unsuccessful restore as a usable deployment. Older configuration-only archives cannot be used for full restore.
+
+For recovery on another server, install Docker/Compose and the chosen reverse proxy first. The PostgreSQL image referenced by the saved Compose file must already be available locally for dump validation. Docker images, TLS certificate storage, firewall rules, and WARP configuration are not included in these backups. Reissue or restore certificates separately and validate/reload the reverse proxy after recovery.
+
+### Readiness Checks
+
+Panel checks require a successful API response and valid HTTPS certificates. Subscription checks verify the service's internal health separately from the public HTTPS endpoint. Check an existing user's subscription URL to verify complete subscription delivery; the public root response alone does not prove it.
+
 ### WARP Native
 
 - native WireGuard-based WARP interface
@@ -232,3 +250,14 @@ Potential future work:
 This project is intended to be open, readable, and practical. Issues, fixes, deployment notes, and documentation improvements are welcome.
 
 If you use it on a real server, include your distribution, version, virtualization type, and reverse proxy choice when reporting problems. That information matters more than a generic "does not work" report.
+
+## Regression Checks
+
+The tests require Bash, jq, OpenSSL, and standard Unix tools. They use temporary files and mock Docker/HTTP calls; they do not install services or contact a running Panel.
+
+```bash
+bash -n remnawave_installer.sh
+for test_file in tests/*.sh; do bash "$test_file" || exit 1; done
+```
+
+A real Ubuntu/Docker installation and database restore should also be checked before a production deployment.
