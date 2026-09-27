@@ -18,7 +18,9 @@ log="$work/events"
 ok() { printf 'success %s\n' "$*" >> "$log"; }
 warn() { :; }
 confirm() { return 0; }
-ask_required() { printf -v "$2" '%s' "$selected"; }
+select_backup_archive() { printf -v "$1" '%s' "$selected"; }
+# Git Bash lacks flock; validate the exact lock call without installing services.
+flock() { [ "$*" = "-n 9" ]; }
 backup_compose() {
   printf '%s\n' "$*" >> "$log"
   case "$*" in

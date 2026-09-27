@@ -109,6 +109,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/cluedesc/remnawave-installer/m
 6. Certificates
 7. Backup / Restore
 8. Support Creator
+9. Diagnose installation
 0. Exit
 ```
 
@@ -116,9 +117,21 @@ bash <(curl -Ls https://raw.githubusercontent.com/cluedesc/remnawave-installer/m
 
 ### Input and Recovery
 
-Invalid passwords, domains, ports, and numbered selections are requested again. Admin password requirements are shown before entry: at least 24 characters, including uppercase letters, lowercase letters, and numbers. Failed authentication lets you retry or return to the menu.
+Invalid passwords, domains, URLs, email addresses, ports, and numbered selections are requested again. Admin password requirements are shown before entry: at least 24 characters, including uppercase letters, lowercase letters, and numbers. Failed authentication lets you retry or return to the Panel URL prompt.
 
-An operation failure or Ctrl+C during an operation returns to the menu and preserves completed steps. If Panel is already installed, finish admin creation through **Panel -> Create Panel admin** and subscription setup through **Panel -> Configure subscription page**. Repeating **Install Panel** leaves existing Panel files in place. A failed system operation can still require fixing the reported problem before retrying; the installer does not automatically undo partially completed operations.
+Use `/back` to go to the previous wizard step, or the enclosing menu for standalone actions. Use `/cancel` or Ctrl+C to leave an operation. These commands are reserved in input fields, including hidden fields. An empty answer still accepts the displayed default.
+
+An operation failure shows the last recorded step and a suggested next action, then returns to the menu. Completed changes generally remain in place; the installer does not automatically undo an interrupted installation. **Install -> Continue Panel setup** checks the actual backend, public access, administrator registration, and subscription page before continuing. It preserves existing secrets and avoids creating another administrator or replacing an existing subscription token. Setup choices are saved in a private draft between launches. Missing original configuration files require recovery from a backup.
+
+You can also finish admin creation through **Panel -> Create Panel admin** or subscription setup through **Panel -> Configure subscription page**.
+
+### Dashboard and Diagnostics
+
+The main menu shows the Panel URL, backend image tag, container states, local certificate expiry, and the latest backup information. An image tag is not a verified exact runtime version. Failed or unavailable probes are shown as unknown rather than healthy.
+
+**Diagnose installation** performs bounded, read-only checks of the API, database readiness, subscription health, DNS, HTTPS, listening ports, and disk usage, with suggested next steps. It does not test an external firewall or complete delivery of a user's subscription.
+
+**System -> Export diagnostic report** writes a private text report under `/etc/remnawave-installer/reports`. Reports contain selected status facts and validated operation metadata, including public domains and DNS addresses. They exclude raw logs, environment files, passwords, tokens, and private keys.
 
 ### Installation
 
@@ -137,6 +150,8 @@ An operation failure or Ctrl+C during an operation returns to the menu and prese
 - dedicated subscription page domain
 - clean root response for subscription domain
 - real subscription paths proxied to the subscription page service
+
+**Panel -> Configure domain / HTTPS** changes the Panel domain or certificate email, or retries a failed HTTPS setup. Managed configuration and credentials are saved before the change, and public access is checked before committing the new settings. On failure the installer attempts to restore the previous managed configuration; private recovery snapshots remain in `/opt/remnawave/.https-backup.*`. Check any rollback error before continuing. Installed packages and certificate stores are outside this configuration rollback. Switching between an existing Caddy and NGINX installation requires a separate proxy migration.
 
 ### Subscription Page
 
@@ -169,6 +184,12 @@ Panel updates and reinstalls require a successful database backup. Reinstall pre
 ### Backup and Restore
 
 Full backups contain a PostgreSQL custom-format dump, Panel and Node configuration, the subscription Compose override, installer state, and the managed Caddy/NGINX configuration files. A failed dump or archive operation does not publish a backup. Archives are private and contain credentials: store an off-server copy securely.
+
+**Backup / Restore** lists archives with their dates and sizes. Restore and **Verify backup** accept a listed archive or a manually entered path. Verification checks archive structure and, for a Panel backup, PostgreSQL dump catalog readability without replacing live data. It is not a full restore rehearsal. Concurrent backup and restore operations are blocked by a shared lock.
+
+**Configure automatic backups** offers daily or weekly backups (Monday) at a chosen server-local time, plus retention by archive count and age. It installs a private backup runner and the `remnawave-installer-backup` systemd service/timer after confirmation. This also works when the installer is launched through process substitution. Failed timer activation restores the previous schedule where possible, and **Show backup schedule** distinguishes configured values from actual timer state. Reapply the schedule after upgrading the installer to refresh its saved runner.
+
+Retention is applied only after a new backup passes verification. It affects archives marked as successfully created by this installer, preserves the newly created backup, and leaves unmarked archives alone. A failed backup never triggers pruning. A limit of `0` disables that limit; turning the schedule off stops automatic runs, while saved retention settings still apply to successful manual backups. Timer failures can be inspected with `journalctl -u remnawave-installer-backup.service`.
 
 If the database is stopped, backup starts only PostgreSQL and returns it to its stopped state afterwards. Application services remain stopped during this operation.
 
@@ -246,8 +267,6 @@ Potential future work:
 - Debian support
 - release-based install command
 - better non-interactive mode
-- richer diagnostics
-- automatic environment report
 - configuration export/import
 - safer migration tools
 
@@ -259,7 +278,7 @@ If you use it on a real server, include your distribution, version, virtualizati
 
 ## Regression Checks
 
-Tests are optional for running the installer. For development, they require Bash, jq, OpenSSL, and standard Unix tools. They use temporary files and mock Docker/HTTP calls; they do not install services or contact a running Panel. They cover configuration, API calls, backups, readiness, input retries, authentication retries, and returning to the menu after an operation fails.
+Tests are optional for running the installer. For development, they require Bash, jq, OpenSSL, and standard Unix tools. They use temporary files and mock Docker/HTTP/systemd calls; they do not install services or contact a running Panel. They cover configuration, API calls, backup verification and retention, schedule activation rollback, readiness, navigation, setup continuation, HTTPS rollback, diagnostic reports, and operation failure recovery. Linux permission, locking, and systemd behavior also need validation on a supported server; Windows test runs cannot establish these properties.
 
 ```bash
 bash -n remnawave_installer.sh

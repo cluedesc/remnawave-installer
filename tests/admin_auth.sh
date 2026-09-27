@@ -69,12 +69,24 @@ INPUT
 [ "$(grep -c '/auth/register' "$requests")" -eq 1 ]
 [ "$(grep -o 'Admin username' "$test_dir/admin-output" | wc -l)" -eq 1 ]
 
+# Back from password revisits username; Back from username revisits mode.
+create_panel_admin 'https://panel.example' <<'INPUT'
+1
+oldadmin
+/back
+/back
+1
+testadmin
+GoodPassword12345678901234
+INPUT
+[ "$PANEL_ADMIN_USERNAME" = testadmin ]
+
 test_register_allowed=false
 create_panel_admin 'https://panel.example' < /dev/null
 [ -z "$PANEL_ADMIN_USERNAME" ]
 test_register_allowed=true
 create_panel_admin 'https://panel.example' <<< '0'
-[ "$(grep -c '/auth/register' "$requests")" -eq 1 ]
+[ "$(grep -c '/auth/register' "$requests")" -eq 2 ]
 registration_fail=true
 create_panel_admin 'https://panel.example' <<'INPUT'
 1
@@ -107,7 +119,7 @@ PANEL_AUTH_USERNAME=""
 PANEL_AUTH_PASSWORD=""
 status=0
 get_panel_api_token 'https://panel.example' result <<< '0' || status=$?
-[ "$status" -eq 130 ]
+[ "$status" -eq 131 ]
 for input in '' '1' $'2\ntestadmin'; do
   status=0
   get_panel_api_token 'https://panel.example' result <<< "$input" || status=$?

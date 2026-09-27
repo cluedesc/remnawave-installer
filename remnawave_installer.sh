@@ -40,6 +40,10 @@ CERTBOT_RENEW_CRON="# remnawave-installer certbot renew"
 WAIT_REFRESH_INTERVAL=1
 HTTP_CHECK_TIMEOUT=2
 
+# Enabled by the entrypoint; sourcing the file is side-effect free for callers/tests.
+OPERATION_TRACKING_ENABLED=0
+OPERATION_ACTIVE=0
+
 RED='\033[1;31m'
 GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
@@ -81,12 +85,13 @@ blank() { log ""; }
 hr() { log "${GRAY}------------------------------------------------------------${RESET}"; }
 
 section() {
+  operation_set_step "$*"
   blank
 
   log "${GREEN}==>${RESET} $*"
 }
 
-step() { log "${GREEN}  -${RESET} $*"; }
+step() { operation_set_step "$*"; log "${GREEN}  -${RESET} $*"; }
 
 info() { log "${GREEN}[+]${RESET} $*"; }
 
@@ -342,6 +347,14 @@ prepare_log() {
   chmod 600 "$LOG_FILE"
 }
 
+navigation_status() {
+  case "$1" in
+    /cancel) return 130 ;;
+    /back) return 131 ;;
+    *) return 0 ;;
+  esac
+}
+
 ask() {
   local __ask_prompt="$1"
   local __ask_var_name="$2"
@@ -350,21 +363,23 @@ ask() {
   local __ask_value=""
 
   if [ -n "$__ask_default_value" ]; then
-    prompt_line "$__ask_prompt "
+    prompt_line "$__ask_prompt (/back: previous, /cancel: exit) "
     prompt_default "[$__ask_default_value]"
 
     printf ": "
 
-    __ask_value="$(read_input)" || return 130
+    __ask_value="$(read_input)" || return $?
 
     __ask_value="${__ask_value:-$__ask_default_value}"
   else
-    prompt_line "$__ask_prompt: "
+    prompt_line "$__ask_prompt (/back: previous, /cancel: exit): "
 
-    __ask_value="$(read_input)" || return 130
+    __ask_value="$(read_input)" || return $?
   fi
 
   __ask_value="$(printf "%s" "$__ask_value" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+  navigation_status "$__ask_value" || return $?
 
   printf -v "$__ask_var_name" '%s' "$__ask_value"
 }
@@ -376,9 +391,11 @@ ask_secret() {
 
   local __ask_secret_value=""
 
-  prompt_line "$__ask_secret_prompt: "
+  prompt_line "$__ask_secret_prompt (/back: previous, /cancel: exit): "
 
-  __ask_secret_value="$(read_secret_input)" || { printf "\n"; return 130; }
+  local __ask_secret_status=0
+  __ask_secret_value="$(read_secret_input)" || __ask_secret_status=$?
+  if [ "$__ask_secret_status" -ne 0 ]; then printf "\n"; return "$__ask_secret_status"; fi
 
   printf "\n"
 
@@ -390,6 +407,8 @@ ask_secret() {
     note "Secret value is empty."
   fi
 
+  navigation_status "$__ask_secret_value" || return $?
+
   printf -v "$__ask_secret_var_name" '%s' "$__ask_secret_value"
 }
 
@@ -400,9 +419,9 @@ ask_required() {
 
   while true; do
     if [ "$#" -ge 3 ]; then
-      ask "$__ask_required_prompt" __ask_required_value "$3" || return 130
+      ask "$__ask_required_prompt" __ask_required_value "$3" || return $?
     else
-      ask "$__ask_required_prompt" __ask_required_value || return 130
+      ask "$__ask_required_prompt" __ask_required_value || return $?
     fi
 
     if [ -n "$__ask_required_value" ]; then
@@ -421,7 +440,7 @@ ask_secret_required() {
   local __ask_secret_required_value=""
 
   while true; do
-    ask_secret "$__ask_secret_required_prompt" __ask_secret_required_value 0 || return 130
+    ask_secret "$__ask_secret_required_prompt" __ask_secret_required_value 0 || return $?
 
     if [ -n "$__ask_secret_required_value" ]; then
       printf -v "$__ask_secret_required_var_name" '%s' "$__ask_secret_required_value"
@@ -436,7 +455,7 @@ ask_secret_required() {
 ask_validated() {
   local __ask_validated_value=""
   while true; do
-    ask "$1" __ask_validated_value "${5:-}" || return 130
+    ask "$1" __ask_validated_value "${5:-}" || return $?
     if "$3" "$__ask_validated_value"; then
       printf -v "$2" '%s' "$__ask_validated_value"
       return 0
@@ -448,7 +467,7 @@ ask_validated() {
 ask_choice() {
   local __ask_choice_value=""
   while true; do
-    ask "$1" __ask_choice_value "${5:-}" || return 130
+    ask "$1" __ask_choice_value "${5:-}" || return $?
     if [[ "$__ask_choice_value" =~ ^[0-9]+$ ]]; then
       # Strip zeroes before arithmetic so input is decimal and cannot overflow.
       while [[ "$__ask_choice_value" == 0?* ]]; do __ask_choice_value="${__ask_choice_value#0}"; done
@@ -467,14 +486,27 @@ confirm() {
   local answer=""
   local normalized=""
 
-  prompt_line "$prompt "
+  prompt_line "$prompt (/back: previous, /cancel: exit) "
   prompt_default "[y/N]"
 
   printf ": "
 
-  answer="$(read_input)" || return 130
+  local read_status=0
+  answer="$(read_input)" || read_status=$?
+  if [ "$read_status" -ne 0 ]; then
+    if [ "${OPERATION_ACTIVE:-0}" = 1 ]; then exit "$read_status"; fi
+    return "$read_status"
+  fi
 
   normalized="$(printf "%s" "$answer" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+
+  local navigation_result=0
+  navigation_status "$normalized" || navigation_result=$?
+  if [ "$navigation_result" -ne 0 ]; then
+    # Legacy callers use confirm in if/! and cannot propagate cancellation.
+    if [ "${OPERATION_ACTIVE:-0}" = 1 ]; then exit "$navigation_result"; fi
+    return "$navigation_result"
+  fi
 
   log_file_append "[$(date '+%Y-%m-%d %H:%M:%S')] CONFIRM: ${prompt} => ${normalized:-<empty>}"
 
@@ -489,9 +521,11 @@ ask_menu_choice() {
   
   local __ask_menu_choice_value=""
 
-  prompt_line "Selection: "
-  __ask_menu_choice_value="$(read_input)" || return 130
+  prompt_line "Selection (/back: previous, /cancel: exit): "
+  __ask_menu_choice_value="$(read_input)" || return $?
   __ask_menu_choice_value="$(printf "%s" "$__ask_menu_choice_value" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+  navigation_status "$__ask_menu_choice_value" || return $?
 
   printf -v "$__ask_menu_choice_var_name" '%s' "$__ask_menu_choice_value"
 }
@@ -501,9 +535,11 @@ ask_delete_confirmation() {
 
   local __ask_delete_confirmation_value=""
 
-  prompt_line "Type DELETE to confirm: "
-  __ask_delete_confirmation_value="$(read_input)" || return 130
+  prompt_line "Type DELETE to confirm (/back: previous, /cancel: exit): "
+  __ask_delete_confirmation_value="$(read_input)" || return $?
   __ask_delete_confirmation_value="$(printf "%s" "$__ask_delete_confirmation_value" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+  navigation_status "$__ask_delete_confirmation_value" || return $?
 
   printf -v "$__ask_delete_confirmation_var_name" '%s' "$__ask_delete_confirmation_value"
 }
@@ -639,6 +675,37 @@ validate_host() {
   is_ipv4 "$host" || validate_domain "$host"
 }
 
+validate_url() {
+  local url="$1" authority host port
+  [[ "$url" =~ ^https?://[^/?#]+(/[^?#]*)?$ ]] || return 1
+  [[ ! "$url" =~ [[:space:][:cntrl:]] && "$url" != *\\* ]] || return 1
+  authority="${url#*://}"
+  authority="${authority%%/*}"
+  [[ "$authority" != *@* ]] || return 1
+  host="${authority%%:*}"
+  if [[ "$authority" == *:* ]]; then
+    port="${authority#*:}"
+    validate_port "$port" || return 1
+  fi
+  [ "$host" = localhost ] || validate_host "$host"
+}
+
+validate_email() {
+  local email="$1" local_part domain
+  [ "${#email}" -le 254 ] || return 1
+  [[ "$email" == *@* ]] || return 1
+  local_part="${email%@*}"
+  domain="${email##*@}"
+  [ "${#local_part}" -le 64 ] || return 1
+  [[ "$local_part" =~ ^[A-Za-z0-9.!\#$%\&\'*+/=?^_\`{|}~-]+$ ]] || return 1
+  [[ "$local_part" != .* && "$local_part" != *. && "$local_part" != *..* ]] || return 1
+  validate_domain "$domain"
+}
+
+validate_optional_email() {
+  [ -z "$1" ] || validate_email "$1"
+}
+
 assert_managed_dir() {
   local dir="$1"
 
@@ -655,9 +722,9 @@ assert_managed_dir() {
 install_base_packages() {
   section "Base packages"
 
-  run_cmd_stream "Update apt package index" apt-get update
+  run_cmd_stream "Update apt package index" apt-get update || return 1
 
-  run_cmd_stream "Install required base packages" apt-get install -y ca-certificates curl gnupg openssl jq ufw logrotate apt-transport-https lsb-release dnsutils
+  run_cmd_stream "Install required base packages" apt-get install -y ca-certificates curl gnupg openssl jq ufw logrotate apt-transport-https lsb-release dnsutils || return 1
 }
 
 install_docker() {
@@ -669,29 +736,30 @@ install_docker() {
 
   section "Docker"
 
-  install -m 0755 -d /etc/apt/keyrings
-  run_cmd_stream "Install Docker apt repository key" bash -c 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --yes --dearmor -o /etc/apt/keyrings/docker.gpg'
-  chmod a+r /etc/apt/keyrings/docker.gpg
+  install -m 0755 -d /etc/apt/keyrings || return 1
+  run_cmd_stream "Install Docker apt repository key" bash -c 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --yes --dearmor -o /etc/apt/keyrings/docker.gpg' || return 1
+  chmod a+r /etc/apt/keyrings/docker.gpg || return 1
 
-  local codename
+  local codename architecture
 
-  codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+  codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")" || return 1
+  architecture=$(dpkg --print-architecture) || return 1
 
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable" > /etc/apt/sources.list.d/docker.list
+  echo "deb [arch=${architecture} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable" > /etc/apt/sources.list.d/docker.list || return 1
 
-  run_cmd_stream "Update apt package index for Docker" apt-get update
+  run_cmd_stream "Update apt package index for Docker" apt-get update || return 1
 
-  run_cmd_stream "Install Docker packages" apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  run_cmd_stream "Install Docker packages" apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
 
-  run_cmd "Enable and start Docker" systemctl enable --now docker
+  run_cmd "Enable and start Docker" systemctl enable --now docker || return 1
 
-  run_cmd "Verify Docker daemon" bash -c 'docker info >/dev/null'
+  run_cmd "Verify Docker daemon" bash -c 'docker info >/dev/null' || return 1
 }
 
 install_prerequisites() {
-  install_base_packages
+  install_base_packages || return 1
 
-  install_docker
+  install_docker || return 1
 }
 
 # PACKAGES END
@@ -877,7 +945,14 @@ backup_node() {
 
 backup_all() (
   umask 077
+  [ ! -L "$BACKUP_ROOT" ] || return 1
   mkdir -p "$BACKUP_ROOT" || return 1
+  chmod 700 "$BACKUP_ROOT" || return 1
+  backup_lock || return 1
+  if [ "${BACKUP_SCHEDULED_RUN:-0}" = 1 ]; then
+    backup_load_schedule || return 1
+    [ "$BACKUP_FREQUENCY" != off ] || return 0
+  fi
   local stage archive path running_services has_panel=0 started_database=0
   stage="$(mktemp -d "${BACKUP_ROOT}/.backup.XXXXXX")" || return 1
   backup_release_database() {
@@ -929,8 +1004,20 @@ backup_all() (
   local members=(manifest files.tar.gz)
   [ "$has_panel" = 0 ] || members+=(database.dump)
   tar -czf "$stage/archive.tar.gz" -C "$stage" -- "${members[@]}" || return 1
+  mkdir "$stage/verify" || return 1
+  backup_unpack_verified "$stage/archive.tar.gz" "$stage/verify" || {
+    warn "Backup validation failed; no backup created."; return 1;
+  }
   backup_release_database || return 1
   mv -- "$stage/archive.tar.gz" "$archive" || return 1
+  [ ! -L "$BACKUP_ROOT/.verified" ] || return 1
+  mkdir -p "$BACKUP_ROOT/.verified" "$STATE_DIR" || return 1
+  chmod 700 "$BACKUP_ROOT/.verified" "$STATE_DIR" || return 1
+  printf '%s\n' "$(date +%s)" > "$BACKUP_ROOT/.verified/${archive##*/}.status" || return 1
+  printf 'status=success\ntimestamp=%s\narchive=%s\n' "$(date +%s)" "$archive" > "$STATE_DIR/last-backup.status.tmp" || return 1
+  chmod 600 "$STATE_DIR/last-backup.status.tmp" || return 1
+  mv -- "$STATE_DIR/last-backup.status.tmp" "$STATE_DIR/last-backup.status" || return 1
+  backup_prune "$archive" || return 1
   ok "Backup archive: ${archive}"
 )
 
@@ -960,16 +1047,9 @@ backup_validate_files() {
   done < "$2/names"
 }
 
-restore_backup() (
-  local archive stage name has_panel
-  while true; do
-    ask_required "Backup .tar.gz path" archive || return $?
-    [ ! -f "$archive" ] || break
-    warn "Backup was not found: ${archive}. Enter an existing archive path."
-  done
-  umask 077
-  stage="$(mktemp -d)" || return 1
-  trap 'rm -rf -- "$stage"' EXIT
+backup_unpack_verified() {
+  local archive="$1" stage="$2" name has_panel
+  [ -f "$archive" ] && [ ! -L "$archive" ] || return 1
   tar -tzf "$archive" > "$stage/members" && tar -tvzf "$archive" > "$stage/types" || return 1
   while IFS= read -r name; do
     case "$name" in manifest|files.tar.gz|database.dump) ;; *) warn "Unsupported or unsafe backup."; return 1 ;; esac
@@ -1004,6 +1084,28 @@ restore_backup() (
   elif grep -Eq "^${PANEL_DIR#/}(/|$)" "$stage/names"; then
     warn "Panel restore requires a database dump."; return 1
   fi
+  printf '%s\n' "$has_panel" > "$stage/panel-status"
+}
+
+verify_backup() (
+  local archive="${1:-}" stage
+  [ -n "$archive" ] || select_backup_archive archive || return $?
+  umask 077
+  stage="$(mktemp -d)" || return 1
+  trap 'rm -rf -- "$stage"' EXIT
+  backup_unpack_verified "$archive" "$stage" || { warn "Backup verification failed."; return 1; }
+  ok "Backup verified: $archive"
+)
+
+restore_backup() (
+  local archive stage has_panel
+  select_backup_archive archive || return $?
+  umask 077
+  backup_lock || return 1
+  stage="$(mktemp -d)" || return 1
+  trap 'rm -rf -- "$stage"' EXIT
+  backup_unpack_verified "$archive" "$stage" || return 1
+  has_panel="$(cat "$stage/panel-status")"
   warn "Restore replaces saved configuration and the Panel database. A failed restore leaves services stopped."
   confirm "Continue restore?" || { warn "Restore cancelled by user."; return 0; }
   # Stop all writers using the CURRENT compose before replacing it.
@@ -1032,6 +1134,283 @@ restore_backup() (
   ok "Backup restored."
 )
 
+# Descriptor locks release automatically on every success, failure and signal.
+backup_lock() {
+  mkdir -p "$BACKUP_ROOT" || return 1
+  [ ! -L "$BACKUP_ROOT/.operation.lock" ] || return 1
+  exec 9>"$BACKUP_ROOT/.operation.lock" || return 1
+  flock -n 9 || { warn "Another backup or restore is running."; return 1; }
+}
+
+backup_archive_paths() {
+  local file
+  for file in "$BACKUP_ROOT"/remnawave-backup-*.tar.gz; do
+    [[ "${file##*/}" =~ ^remnawave-backup-[0-9]{14}-[a-zA-Z0-9]+\.tar\.gz$ ]] || continue
+    [ -f "$file" ] && [ ! -L "$file" ] || continue
+    printf '%s\n' "$file"
+  done | sort -r
+}
+
+list_backups() {
+  local file index=0
+  while IFS= read -r file; do
+    index=$((index + 1))
+    printf '%s) %s | %s bytes | %s\n' "$index" "$(stat -c '%y' -- "$file")" "$(stat -c '%s' -- "$file")" "${file##*/}"
+  done < <(backup_archive_paths)
+  [ "$index" -gt 0 ] || printf 'No saved backup archives.\n'
+}
+
+select_backup_archive() {
+  local output="$1" selection chosen
+  local archives=()
+  mapfile -t archives < <(backup_archive_paths)
+  list_backups
+  printf 'm) Enter an archive path manually\n0) Back\n'
+  while true; do
+    ask "Backup number or m" selection || return $?
+    case "$selection" in
+      0|/back) return 131 ;;
+      /cancel) return 130 ;;
+      m|M)
+        ask_required "Backup .tar.gz path" chosen || return $?
+        ;;
+      *)
+        if [[ "$selection" =~ ^[1-9][0-9]{0,5}$ ]] && [ "$selection" -le "${#archives[@]}" ]; then
+          chosen="${archives[selection-1]}"
+        else warn "Select a listed number, m, or 0."; continue; fi
+        ;;
+    esac
+    [ -f "$chosen" ] && [ ! -L "$chosen" ] || { warn "Select an existing regular archive file."; continue; }
+    printf -v "$output" '%s' "$chosen"
+    return 0
+  done
+}
+
+backup_load_schedule() {
+  BACKUP_FREQUENCY=off BACKUP_TIME=03:00 BACKUP_KEEP=7 BACKUP_DAYS=30
+  local key value
+  [ -f "$STATE_DIR/backup-schedule.conf" ] || return 0
+  [ ! -L "$STATE_DIR/backup-schedule.conf" ] || return 1
+  while IFS='=' read -r key value; do
+    case "$key" in
+      frequency) BACKUP_FREQUENCY="$value" ;;
+      time) BACKUP_TIME="$value" ;;
+      keep) BACKUP_KEEP="$value" ;;
+      days) BACKUP_DAYS="$value" ;;
+      *) return 1 ;;
+    esac
+  done < "$STATE_DIR/backup-schedule.conf"
+  [[ "$BACKUP_FREQUENCY" =~ ^(off|daily|weekly)$ ]] &&
+    [[ "$BACKUP_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] &&
+    [[ "$BACKUP_KEEP" =~ ^(0|[1-9][0-9]{0,4})$ ]] &&
+    [[ "$BACKUP_DAYS" =~ ^(0|[1-9][0-9]{0,4})$ ]]
+}
+
+backup_schedule_unit_dir() { printf '/etc/systemd/system\n'; }
+
+backup_schedule_systemctl() {
+  timeout --kill-after=5 15 systemctl "$@"
+}
+
+backup_timer_state() {
+  local output key value
+  BACKUP_TIMER_ENABLED=unknown BACKUP_TIMER_ACTIVE=unknown BACKUP_TIMER_LOAD=unknown
+  output="$(backup_schedule_systemctl show remnawave-installer-backup.timer \
+    --property=UnitFileState --property=ActiveState --property=LoadState 2>/dev/null)" || return 1
+  while IFS='=' read -r key value; do
+    case "$key:$value" in
+      UnitFileState:enabled|UnitFileState:disabled|UnitFileState:static|UnitFileState:masked|UnitFileState:indirect)
+        BACKUP_TIMER_ENABLED="$value" ;;
+      ActiveState:active|ActiveState:inactive|ActiveState:failed) BACKUP_TIMER_ACTIVE="$value" ;;
+      LoadState:loaded|LoadState:not-found|LoadState:masked) BACKUP_TIMER_LOAD="$value" ;;
+    esac
+  done <<< "$output"
+  if [ "$BACKUP_TIMER_LOAD" = not-found ]; then
+    BACKUP_TIMER_ENABLED=absent
+  fi
+  [ "$BACKUP_TIMER_ENABLED" != unknown ] && [ "$BACKUP_TIMER_ACTIVE" != unknown ] && [ "$BACKUP_TIMER_LOAD" != unknown ]
+}
+
+show_backup_schedule() {
+  backup_load_schedule || { warn "Invalid backup schedule configuration."; return 1; }
+  printf 'Configured schedule: %s at %s, server local time (%s); weekly runs Monday.\nKeep count: %s; maximum age: %s days (0 disables a limit).\n' \
+    "$BACKUP_FREQUENCY" "$BACKUP_TIME" "$(date +%Z)" "$BACKUP_KEEP" "$BACKUP_DAYS"
+  backup_timer_state || true
+  printf 'Actual timer: enabled=%s; active=%s; unit=%s.\n' "$BACKUP_TIMER_ENABLED" "$BACKUP_TIMER_ACTIVE" "$BACKUP_TIMER_LOAD"
+}
+
+backup_prune() {
+  local newest="$1" file marker epoch now rank=0
+  [ -f "$STATE_DIR/backup-schedule.conf" ] || return 0
+  [ ! -L "$BACKUP_ROOT/.verified" ] || return 1
+  backup_load_schedule || return 1
+  now="$(date +%s)"
+  # Only archives successfully verified by this installer have private markers.
+  while IFS= read -r file; do
+    marker="$BACKUP_ROOT/.verified/${file##*/}.status"
+    [ -f "$marker" ] && [ ! -L "$marker" ] || continue
+    IFS= read -r epoch < "$marker" || continue
+    [[ "$epoch" =~ ^[0-9]{1,12}$ ]] || continue
+    rank=$((rank + 1))
+    [ "$file" != "$newest" ] || continue
+    if { [ "$BACKUP_KEEP" -gt 0 ] && [ "$rank" -gt "$BACKUP_KEEP" ]; } ||
+       { [ "$BACKUP_DAYS" -gt 0 ] && [ "$((now - epoch))" -gt "$((BACKUP_DAYS * 86400))" ]; }; then
+      rm -- "$file" && rm -- "$marker" || return 1
+    fi
+  done < <(backup_archive_paths)
+}
+
+# Snapshot only backup code and these four nonsecret paths. This works when the
+# interactive installer came from process substitution; no runtime download.
+backup_write_runner() {
+  local function_name variable_name
+  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\numask 077\n'
+  for variable_name in PANEL_DIR NODE_DIR STATE_DIR BACKUP_ROOT; do
+    printf '%s=%q\n' "$variable_name" "${!variable_name}"
+  done
+  cat <<'RUNNER_HELPERS'
+ok() { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+need_root() { [ "$EUID" = 0 ] || { warn 'Scheduled backups require root.'; return 1; }; }
+RUNNER_HELPERS
+  for function_name in backup_all backup_lock backup_compose backup_wait_database \
+    backup_validate_files backup_unpack_verified backup_prune backup_load_schedule \
+    backup_archive_paths run_scheduled_backup; do
+    declare -f "$function_name" || return 1
+  done
+  printf '\nneed_root || exit $?\nrun_scheduled_backup\n'
+}
+
+backup_write_schedule_units() {
+  local calendar="$1" unit_dir="${2:-$(backup_schedule_unit_dir)}"
+  printf '[Unit]\nDescription=Remnawave verified backup\n[Service]\nType=oneshot\nUMask=0077\nExecStart=/bin/bash %s/backup-runner.sh --scheduled-backup\n' "$STATE_DIR" > "$unit_dir/remnawave-installer-backup.service" || return 1
+  printf '[Unit]\nDescription=Remnawave backup schedule\n[Timer]\nOnCalendar=%s\nPersistent=true\n[Install]\nWantedBy=timers.target\n' "$calendar" > "$unit_dir/remnawave-installer-backup.timer" || return 1
+}
+
+configure_backup_schedule() (
+  local frequency time keep days calendar
+  backup_load_schedule || return 1
+  while true; do
+    ask "Schedule: off, daily, weekly (0: back)" frequency "$BACKUP_FREQUENCY" || return $?
+    [ "$frequency" != 0 ] || return 131
+    [[ "$frequency" =~ ^(off|daily|weekly)$ ]] && break
+    warn "Choose off, daily or weekly."
+  done
+  time="$BACKUP_TIME" keep="$BACKUP_KEEP" days="$BACKUP_DAYS"
+  if [ "$frequency" != off ]; then
+    while true; do
+      ask "Time HH:MM, server local time" time "$time" || return $?
+      [[ "$time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && break
+      warn "Enter 00:00 through 23:59."
+    done
+    while true; do
+      ask "Keep newest archives (0: unlimited)" keep "$keep" || return $?
+      [[ "$keep" =~ ^(0|[1-9][0-9]{0,4})$ ]] && break
+      warn "Enter an integer from 0 to 99999."
+    done
+    while true; do
+      ask "Maximum age in days (0: unlimited)" days "$days" || return $?
+      [[ "$days" =~ ^(0|[1-9][0-9]{0,4})$ ]] && break
+      warn "Enter an integer from 0 to 99999."
+    done
+    # systemd paths are deliberately restricted to avoid unit directive injection.
+    [[ "$STATE_DIR" =~ ^/[a-zA-Z0-9_./-]+$ ]] || return 1
+  fi
+  printf 'Schedule: %s at %s (%s); weekly: Monday. Keep: %s; age: %s days. Newest successful backup is always preserved.\n' "$frequency" "$time" "$(date +%Z)" "$keep" "$days"
+  confirm "Apply this backup schedule?" || return $?
+  command -v systemctl >/dev/null || { warn "systemd is required for scheduled backups."; return 1; }
+  umask 077
+  backup_lock || return 1
+  mkdir -p "$STATE_DIR" || return 1
+  chmod 700 "$STATE_DIR" || return 1
+  local unit_dir snapshot prior_enabled prior_active prior_load file index=0 changed=0 committed=0
+  unit_dir="$(backup_schedule_unit_dir)" || return 1
+  backup_timer_state || { warn "Cannot determine the current timer state; schedule unchanged."; return 1; }
+  prior_enabled="$BACKUP_TIMER_ENABLED" prior_active="$BACKUP_TIMER_ACTIVE" prior_load="$BACKUP_TIMER_LOAD"
+  case "$prior_enabled" in enabled|disabled|absent) ;; *) warn "Timer has unsupported state $prior_enabled; schedule unchanged."; return 1 ;; esac
+  local owned=("$STATE_DIR/backup-schedule.conf" "$STATE_DIR/backup-runner.sh"
+    "$unit_dir/remnawave-installer-backup.service" "$unit_dir/remnawave-installer-backup.timer")
+  snapshot="$(mktemp -d "$STATE_DIR/.backup-schedule.XXXXXX")" || return 1
+  backup_schedule_cleanup() {
+    local status="$?" rollback_ok=1 position=0 target
+    trap - EXIT
+    if [ "$changed" = 1 ] && [ "$committed" = 0 ]; then
+      # Stop the new timer before restoring files; the shared lock excludes backups.
+      if [ -f "$unit_dir/remnawave-installer-backup.timer" ] || [ "$prior_load" != not-found ]; then
+        backup_schedule_systemctl disable --now remnawave-installer-backup.timer >/dev/null 2>&1 || rollback_ok=0
+      fi
+      for target in "${owned[@]}"; do
+        if [ -f "$snapshot/$position" ]; then
+          cp -p -- "$snapshot/$position" "$target" || rollback_ok=0
+        else
+          rm -f -- "$target" || rollback_ok=0
+        fi
+        position=$((position + 1))
+      done
+      backup_schedule_systemctl daemon-reload || rollback_ok=0
+      if [ "$prior_enabled" = enabled ]; then
+        backup_schedule_systemctl enable remnawave-installer-backup.timer || rollback_ok=0
+      elif [ "$prior_load" != not-found ]; then
+        backup_schedule_systemctl disable remnawave-installer-backup.timer || rollback_ok=0
+      fi
+      if [ "$prior_active" = active ]; then
+        backup_schedule_systemctl start remnawave-installer-backup.timer || rollback_ok=0
+      elif [ "$prior_load" != not-found ]; then
+        backup_schedule_systemctl stop remnawave-installer-backup.timer || rollback_ok=0
+      fi
+      status=1
+      if [ "$rollback_ok" = 1 ]; then
+        warn "Backup schedule update failed; previous configuration and timer state restored."
+      else
+        warn "Backup schedule update failed; timer rollback needs attention. Saved previous files: $snapshot"
+      fi
+    fi
+    rm -f -- "$STATE_DIR/backup-runner.sh.tmp" "$STATE_DIR/backup-schedule.conf.tmp"
+    [ "$rollback_ok" != 1 ] || rm -rf -- "$snapshot"
+    exit "$status"
+  }
+  trap backup_schedule_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  for file in "${owned[@]}"; do
+    [ ! -L "$file" ] || { warn "Refusing linked schedule file: $file"; return 1; }
+    if [ -e "$file" ]; then
+      [ -f "$file" ] && cp -p -- "$file" "$snapshot/$index" || return 1
+    fi
+    index=$((index + 1))
+  done
+  changed=1
+  if [ "$frequency" = off ]; then
+    if [ "$prior_load" != not-found ]; then
+      backup_schedule_systemctl disable --now remnawave-installer-backup.timer || return 1
+    fi
+  else
+    backup_write_runner > "$STATE_DIR/backup-runner.sh.tmp" || return 1
+    bash -n "$STATE_DIR/backup-runner.sh.tmp" || return 1
+    chmod 700 "$STATE_DIR/backup-runner.sh.tmp" || return 1
+    mv -- "$STATE_DIR/backup-runner.sh.tmp" "$STATE_DIR/backup-runner.sh" || return 1
+    calendar="*-*-* $time:00"
+    [ "$frequency" != weekly ] || calendar="Mon *-*-* $time:00"
+    backup_write_schedule_units "$calendar" "$unit_dir" || return 1
+    backup_schedule_systemctl daemon-reload || return 1
+  fi
+  printf 'frequency=%s\ntime=%s\nkeep=%s\ndays=%s\n' "$frequency" "$time" "$keep" "$days" > "$STATE_DIR/backup-schedule.conf.tmp" || return 1
+  mv -- "$STATE_DIR/backup-schedule.conf.tmp" "$STATE_DIR/backup-schedule.conf" || return 1
+  if [ "$frequency" != off ]; then
+    backup_schedule_systemctl enable --now remnawave-installer-backup.timer || return 1
+    backup_schedule_systemctl restart remnawave-installer-backup.timer || return 1
+  fi
+  committed=1
+  show_backup_schedule
+)
+
+run_scheduled_backup() {
+  local BACKUP_SCHEDULED_RUN=1
+  backup_load_schedule || return 1
+  [ "$BACKUP_FREQUENCY" != off ] || return 0
+  backup_all
+}
+
 # BACKUP_RESTORE END
 
 # PANEL_STATE BEGIN
@@ -1046,14 +1425,26 @@ save_panel_state() {
   
   chmod 700 "$STATE_DIR"
   
-  cat > "$PANEL_STATE_FILE" <<EOF
+  local state_tmp
+  state_tmp=$(umask 077; mktemp "${PANEL_STATE_FILE}.XXXXXX") || return 1
+  cat > "$state_tmp" <<EOF
 PANEL_DOMAIN=$(shell_quote "$panel_domain")
 WEBSERVER=$(shell_quote "$webserver")
 LETSENCRYPT_EMAIL=$(shell_quote "$email")
 SUBSCRIPTION_DOMAIN=$(shell_quote "$subscription_domain")
 EOF
 
-  chmod 600 "$PANEL_STATE_FILE"
+  chmod 600 "$state_tmp" && mv -f -- "$state_tmp" "$PANEL_STATE_FILE"
+}
+
+save_panel_draft() {
+  local PANEL_STATE_FILE="${PANEL_STATE_FILE}.draft"
+  save_panel_state "$@"
+}
+
+load_panel_draft() {
+  local PANEL_STATE_FILE="${PANEL_STATE_FILE}.draft"
+  load_panel_state
 }
 
 load_panel_state() {
@@ -1192,23 +1583,23 @@ install_caddy() {
   if command_exists caddy; then
     ok "Caddy is already installed."
 
-    run_cmd "Ensure Caddy service is enabled" systemctl enable --now caddy || true
+    run_cmd "Ensure Caddy service is enabled" systemctl enable --now caddy || return 1
 
     return 0
   fi
 
   section "Caddy"
 
-  run_cmd_stream "Install Caddy repository prerequisites" apt-get install -y debian-keyring debian-archive-keyring
+  run_cmd_stream "Install Caddy repository prerequisites" apt-get install -y debian-keyring debian-archive-keyring || return 1
 
-  run_cmd_stream "Install Caddy apt repository key" bash -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg"
-  run_cmd "Install Caddy apt source list" bash -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list"
+  run_cmd_stream "Install Caddy apt repository key" bash -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg" || return 1
+  run_cmd "Install Caddy apt source list" bash -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list" || return 1
 
-  run_cmd_stream "Update apt package index for Caddy" apt-get update
+  run_cmd_stream "Update apt package index for Caddy" apt-get update || return 1
 
-  run_cmd_stream "Install Caddy" apt-get install -y caddy
+  run_cmd_stream "Install Caddy" apt-get install -y caddy || return 1
   
-  run_cmd "Enable and start Caddy" systemctl enable --now caddy
+  run_cmd "Enable and start Caddy" systemctl enable --now caddy || return 1
 }
 
 caddy_global_email() {
@@ -1338,62 +1729,64 @@ configure_caddy_panel() {
   local panel_domain="$1"
   local email="$2"
 
-  local caddyfile="/etc/caddy/Caddyfile"
+  local caddyfile="${PANEL_CADDY_FILE:-/etc/caddy/Caddyfile}"
 
   local tmp_file
 
-  install_caddy
+  install_caddy || return 1
 
-  mkdir -p /etc/caddy /var/log/caddy
+  mkdir -p /etc/caddy /var/log/caddy || return 1
   chown -R caddy:caddy /var/log/caddy || true
-  touch /var/log/caddy/remnawave-panel.access.log
+  touch /var/log/caddy/remnawave-panel.access.log || return 1
   chown caddy:caddy /var/log/caddy/remnawave-panel.access.log || true
   chmod 640 /var/log/caddy/remnawave-panel.access.log || true
 
-  [ -f "$caddyfile" ] || touch "$caddyfile"
+  [ -f "$caddyfile" ] || touch "$caddyfile" || return 1
 
-  cp "$caddyfile" "${caddyfile}.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$caddyfile" "${caddyfile}.bak.$(date +%Y%m%d%H%M%S)" || return 1
 
-  ensure_caddy_global_email "$caddyfile" "$email"
 
-  tmp_file="$(mktemp)"
+
+  tmp_file="$(mktemp "${caddyfile}.stage.XXXXXX")" || return 1
 
   awk '
     /^# BEGIN REMNAWAVE PANEL$/ { skip=1; next }
     /^# END REMNAWAVE PANEL$/ { skip=0; next }
     skip != 1 { print }
-  ' "$caddyfile" > "$tmp_file"
+  ' "$caddyfile" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
 
   {
-    printf "\n# BEGIN REMNAWAVE PANEL\n"
-    printf "%s {\n" "$panel_domain"
-    printf "\tencode zstd gzip\n"
-    printf "\tlog {\n"
-    printf "\t\toutput file /var/log/caddy/remnawave-panel.access.log {\n"
-    printf "\t\t\troll_size 100MiB\n"
-    printf "\t\t\troll_keep 10\n"
-    printf "\t\t\troll_keep_for 720h\n"
-    printf "\t\t}\n"
-    printf "\t\tformat json\n"
-    printf "\t}\n"
-    printf "\theader {\n"
-    printf "\t\tStrict-Transport-Security \"max-age=31536000; includeSubDomains\"\n"
-    printf "\t\tX-Content-Type-Options \"nosniff\"\n"
-    printf "\t\tX-Frame-Options \"SAMEORIGIN\"\n"
-    printf "\t\tReferrer-Policy \"strict-origin-when-cross-origin\"\n"
-    printf "\t}\n"
-    printf "\treverse_proxy 127.0.0.1:3000\n"
-    printf "}\n"
-    printf "# END REMNAWAVE PANEL\n"
-  } >> "$tmp_file"
+    printf "\n# BEGIN REMNAWAVE PANEL\n" || { rm -f "$tmp_file"; return 1; }
+    printf "%s {\n" "$panel_domain" || { rm -f "$tmp_file"; return 1; }
+    if [ -n "$email" ]; then printf "\ttls %s\n" "$email" || { rm -f "$tmp_file"; return 1; }; fi
+    printf "\tencode zstd gzip\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\tlog {\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\toutput file /var/log/caddy/remnawave-panel.access.log {\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\t\troll_size 100MiB\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\t\troll_keep 10\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\t\troll_keep_for 720h\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\t}\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\tformat json\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t}\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\theader {\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\tStrict-Transport-Security \"max-age=31536000; includeSubDomains\"\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\tX-Content-Type-Options \"nosniff\"\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\tX-Frame-Options \"SAMEORIGIN\"\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t\tReferrer-Policy \"strict-origin-when-cross-origin\"\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\t}\n" || { rm -f "$tmp_file"; return 1; }
+    printf "\treverse_proxy 127.0.0.1:3000\n" || { rm -f "$tmp_file"; return 1; }
+    printf "}\n" || { rm -f "$tmp_file"; return 1; }
+    printf "# END REMNAWAVE PANEL\n" || { rm -f "$tmp_file"; return 1; }
+  } >> "$tmp_file" || { rm -f "$tmp_file"; return 1; }
 
-  install -o root -g caddy -m 640 "$tmp_file" "$caddyfile"
+  run_cmd_stream "Validate staged Caddy configuration" caddy validate --adapter caddyfile --config "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+  install -o root -g caddy -m 640 "$tmp_file" "$caddyfile" || return 1
 
   rm -f "$tmp_file"
 
-  run_cmd_stream "Validate Caddy configuration" caddy validate --config "$caddyfile"
+  run_cmd_stream "Validate Caddy configuration" caddy validate --config "$caddyfile" || return 1
 
-  run_cmd "Reload Caddy" systemctl reload caddy
+  run_cmd "Reload Caddy" systemctl reload caddy || return 1
 
   ok "Caddy configured for ${panel_domain}. Certificate issuance will be handled automatically by Caddy."
 }
@@ -1402,13 +1795,13 @@ install_nginx() {
   if command_exists nginx; then
     ok "NGINX is already installed."
 
-    run_cmd_stream "Install Certbot NGINX plugin" apt-get install -y certbot python3-certbot-nginx
+    run_cmd_stream "Install Certbot NGINX plugin" apt-get install -y certbot python3-certbot-nginx || return 1
 
-    run_cmd "Ensure NGINX service is enabled" systemctl enable --now nginx || true
+    run_cmd "Ensure NGINX service is enabled" systemctl enable --now nginx || return 1
   else
     section "NGINX"
 
-    run_cmd_stream "Install NGINX apt repository key" bash -c 'curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --yes --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg'
+    run_cmd_stream "Install NGINX apt repository key" bash -c 'curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --yes --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg' || return 1
     
     echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" > /etc/apt/sources.list.d/nginx.list
     
@@ -1418,11 +1811,11 @@ install_nginx() {
       'Pin: release o=nginx' \
       'Pin-Priority: 900' > /etc/apt/preferences.d/99nginx
     
-    run_cmd_stream "Update apt package index for NGINX" apt-get update
+    run_cmd_stream "Update apt package index for NGINX" apt-get update || return 1
 
-    run_cmd_stream "Install NGINX and Certbot" apt-get install -y nginx certbot python3-certbot-nginx
+    run_cmd_stream "Install NGINX and Certbot" apt-get install -y nginx certbot python3-certbot-nginx || return 1
 
-    run_cmd "Enable and start NGINX" systemctl enable --now nginx
+    run_cmd "Enable and start NGINX" systemctl enable --now nginx || return 1
   fi
 }
 
@@ -1430,17 +1823,19 @@ configure_nginx_panel() {
   local panel_domain="$1"
   local email="$2"
 
-  local conf="/etc/nginx/conf.d/remnawave-panel.conf"
+  local conf="${PANEL_NGINX_FILE:-/etc/nginx/conf.d/remnawave-panel.conf}"
 
   local certbot_args=()
+  local stage_conf
 
-  install_nginx
+  install_nginx || return 1
 
   if [ -f "$conf" ]; then
-    cp "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)" || return 1
   fi
 
-  cat > "$conf" <<EOF
+  stage_conf=$(mktemp "${conf}.stage.XXXXXX") || return 1
+  cat > "$stage_conf" <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -1467,9 +1862,12 @@ server {
 }
 EOF
 
-  run_cmd_stream "Validate NGINX configuration" nginx -t
+  local write_status=$?
+  [ "$write_status" = 0 ] || { rm -f "$stage_conf"; return "$write_status"; }
+  chmod 644 "$stage_conf" && mv -f "$stage_conf" "$conf" || { rm -f "$stage_conf"; return 1; }
+  run_cmd_stream "Validate NGINX configuration" nginx -t || return 1
 
-  run_cmd "Reload NGINX" systemctl reload nginx
+  run_cmd "Reload NGINX" systemctl reload nginx || return 1
 
   if [ -n "$email" ]; then
     certbot_args+=(--email "$email")
@@ -1477,13 +1875,13 @@ EOF
     certbot_args+=(--register-unsafely-without-email)
   fi
 
-  run_cmd_stream "Issue TLS certificate with Certbot" certbot --nginx -d "$panel_domain" "${certbot_args[@]}" --agree-tos --non-interactive --redirect
+  run_cmd_stream "Issue TLS certificate with Certbot" certbot --nginx -d "$panel_domain" "${certbot_args[@]}" --agree-tos --non-interactive --redirect || return 1
 
   setup_certbot_auto_renew "nginx" || warn "Certbot auto-renew setup reported an error."
 
-  run_cmd_stream "Validate NGINX configuration after Certbot" nginx -t
+  run_cmd_stream "Validate NGINX configuration after Certbot" nginx -t || return 1
 
-  run_cmd "Reload NGINX after Certbot" systemctl reload nginx
+  run_cmd "Reload NGINX after Certbot" systemctl reload nginx || return 1
 
   ok "NGINX and TLS configured for ${panel_domain}."
 }
@@ -1923,7 +2321,7 @@ issue_cloudflare_wildcard_cert() {
 
   ask_validated "Base domain, for example example.com" base_domain validate_domain "Enter a domain such as example.com, without a URL or path."
 
-  ask_required "Email Let's Encrypt" email
+  ask_validated "Email Let's Encrypt" email validate_email "Enter an email such as admin@example.com." || return $?
 
   ask_secret_required "Cloudflare API token" token
 
@@ -1960,7 +2358,7 @@ issue_gcore_wildcard_cert() {
 
   ask_validated "Base domain, for example example.com" base_domain validate_domain "Enter a domain such as example.com, without a URL or path."
 
-  ask_required "Email Let's Encrypt" email
+  ask_validated "Email Let's Encrypt" email validate_email "Enter an email such as admin@example.com." || return $?
 
   ask_secret_required "Gcore API token" token
 
@@ -2299,7 +2697,7 @@ start_panel_stack() {
 
 create_panel_admin() {
   local panel_base="${1:-}"
-  local mode username="" password response access_token response_file http_code register_allowed
+  local input_status mode username="" password response access_token response_file http_code register_allowed
   PANEL_ADMIN_USERNAME=""
   PANEL_ADMIN_PASSWORD=""
 
@@ -2307,7 +2705,7 @@ create_panel_admin() {
     panel_base="$(default_panel_api_base)"
   fi
 
-  if ! response=$(curl -fsS -H "X-Forwarded-Proto: https" -H "X-Forwarded-For: 127.0.0.1" "${panel_base%/}/api/auth/status"); then
+  if ! response=$(curl -fsS --connect-timeout 5 --max-time 30 -H "X-Forwarded-Proto: https" -H "X-Forwarded-For: 127.0.0.1" "${panel_base%/}/api/auth/status"); then
     warn "Panel API at ${panel_base} did not respond. Retry admin creation from the Panel menu."
     return 1
   fi
@@ -2324,16 +2722,22 @@ create_panel_admin() {
     menu_item 2 "Generate automatically"
     menu_item 0 "Skip"
     blank
-    ask_choice "Selection" mode 0 2 "1" || return 130
+    ask_choice "Selection" mode 0 2 "1" || return $?
 
     case "$mode" in
       1)
-        ask_required "Admin username" username "$username" || return 130
-        info "Admin password requires at least 24 characters, including uppercase and lowercase letters and numbers."
         while true; do
-          ask_secret_required "Admin password" password || return 130
-          if validate_admin_password "$password"; then break; fi
-          warn "Password must be at least 24 characters and include uppercase and lowercase letters and numbers. Please try again."
+          input_status=0
+          ask_required "Admin username" username "$username" || input_status=$?
+          case "$input_status" in 131) continue 2 ;; 0) ;; *) return "$input_status" ;; esac
+          info "Admin password requires at least 24 characters, including uppercase and lowercase letters and numbers."
+          while true; do
+            input_status=0
+            ask_secret_required "Admin password" password || input_status=$?
+            case "$input_status" in 131) continue 2 ;; 0) ;; *) return "$input_status" ;; esac
+            if validate_admin_password "$password"; then break 2; fi
+            warn "Password must be at least 24 characters and include uppercase and lowercase letters and numbers. Please try again."
+          done
         done
         ;;
       2)
@@ -2347,7 +2751,7 @@ create_panel_admin() {
     esac
 
     response_file="$(mktemp)" || return 1
-    http_code=$(curl -sS -o "$response_file" -w "%{http_code}" -X POST "${panel_base%/}/api/auth/register" \
+    http_code=$(curl -sS --connect-timeout 5 --max-time 30 -o "$response_file" -w "%{http_code}" -X POST "${panel_base%/}/api/auth/register" \
       -H "Content-Type: application/json" \
       -H "X-Forwarded-Proto: https" \
       -H "X-Forwarded-For: 127.0.0.1" \
@@ -2382,7 +2786,11 @@ print_panel_summary() {
 
   section "Completed: Remnawave Panel"
 
-  summary_item "URL" "https://${panel_domain}"
+  if [ "$webserver" = none ]; then
+    summary_item "Local URL" "http://127.0.0.1:3000"
+  else
+    summary_item "URL" "https://${panel_domain}"
+  fi
 
   if [ -n "$subscription_domain" ]; then
     summary_item "Subscription URL" "https://${subscription_domain}"
@@ -2394,8 +2802,7 @@ print_panel_summary() {
   summary_item "Reverse proxy" "${webserver}"
 
   if [ -n "$PANEL_ADMIN_USERNAME" ] && [ -n "$PANEL_ADMIN_PASSWORD" ]; then
-    summary_item "Admin username" "${PANEL_ADMIN_USERNAME}"
-    summary_item "Admin password" "${PANEL_ADMIN_PASSWORD}"
+    printf '    Admin username: %s\n    Admin password: %s\n' "$PANEL_ADMIN_USERNAME" "$PANEL_ADMIN_PASSWORD"
   fi
 
   summary_item "Panel logs" "sudo bash install_remnawave.sh -> Panel -> Logs"
@@ -2442,118 +2849,194 @@ prepare_new_panel_files() (
   published=1
 )
 
-install_panel() {
-  local panel_domain
-  local subscription_domain
-  local subscription_domain_default
-  local letsencrypt_email
-  local webserver_choice
-  local webserver
+# Collect all choices before installing packages or downloading files. Drafts contain no secrets.
+panel_setup_preferences() {
+  local include_subscription="${1:-yes}" step=1 rc choice=1
+  load_panel_state
+  load_panel_draft
+  PANEL_DOMAIN="${PANEL_DOMAIN:-}"
+  SUBSCRIPTION_DOMAIN="${SUBSCRIPTION_DOMAIN:-}"
+  LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
+  WEBSERVER="${WEBSERVER:-caddy}"
+  while [ "$step" -le 4 ]; do
+    rc=0
+    case "$step" in
+      1) ask_validated "Panel domain" PANEL_DOMAIN validate_domain "Enter a domain without https:// or a path." "$PANEL_DOMAIN" || rc=$? ;;
+      2)
+        if [ "$include_subscription" = no ]; then step=3; continue; fi
+        ask_validated "Subscription page domain" SUBSCRIPTION_DOMAIN validate_domain "Enter a valid domain." "${SUBSCRIPTION_DOMAIN:-$(default_subscription_domain "$PANEL_DOMAIN")}" || rc=$?
+        if [ "$rc" = 0 ] && [ "$SUBSCRIPTION_DOMAIN" = "$PANEL_DOMAIN" ]; then warn "Choose different Panel and subscription domains."; continue; fi
+        ;;
+      3) ask_validated "Certificate email (optional)" LETSENCRYPT_EMAIL validate_optional_email "Enter a valid email address or leave empty." "$LETSENCRYPT_EMAIL" || rc=$? ;;
+      4)
+        case "$WEBSERVER" in caddy) choice=1;; nginx) choice=2;; none) choice=3;; esac
+        menu_item 1 "Caddy, automatic HTTPS"
+        menu_item 2 "NGINX + Certbot"
+        menu_item 3 "Local access only"
+        ask_choice "Reverse proxy" choice 1 3 "$choice" || rc=$?
+        if [ "$rc" = 0 ]; then case "$choice" in 1) WEBSERVER=caddy;; 2) WEBSERVER=nginx;; 3) WEBSERVER=none;; esac; fi
+        ;;
+    esac
+    case "$rc" in
+      0) save_panel_draft "$PANEL_DOMAIN" "$WEBSERVER" "$LETSENCRYPT_EMAIL" "$SUBSCRIPTION_DOMAIN" || return 1; step=$((step+1));;
+      131) if [ "$step" -gt 1 ]; then step=$((step-1)); [ "$include_subscription:$step" != no:2 ] || step=1; else return 131; fi;;
+      *) return "$rc";;
+    esac
+  done
+}
 
-  section "Install Remnawave Panel"
+panel_proxy_path() {
+  case "$1" in
+    caddy) printf '%s' "${PANEL_CADDY_FILE:-/etc/caddy/Caddyfile}";;
+    nginx) printf '%s' "${PANEL_NGINX_FILE:-/etc/nginx/conf.d/remnawave-panel.conf}";;
+  esac
+}
 
-  if [ -e "$PANEL_DIR/.env" ] || [ -L "$PANEL_DIR/.env" ] ||
-    [ -e "$PANEL_DIR/docker-compose.yml" ] || [ -L "$PANEL_DIR/docker-compose.yml" ]; then
-    if [ ! -f "$PANEL_DIR/.env" ] || [ ! -f "$PANEL_DIR/docker-compose.yml" ]; then
-      warn "Panel configuration is incomplete in ${PANEL_DIR}. Existing files and secrets were preserved."
-      note "Restore the missing .env or docker-compose.yml from your backup, then use Panel -> Start."
-      note "Newly generated credentials cannot replace the original credentials of an existing database."
+# Never switch a live proxy implicitly: its other sites may depend on it.
+check_panel_proxy_choice() {
+  local selected="$1" other
+  if [ "$selected" = none ] && { grep -Fq '# BEGIN REMNAWAVE PANEL' "$(panel_proxy_path caddy)" 2>/dev/null || [ -s "$(panel_proxy_path nginx)" ]; }; then
+    warn "Existing proxy configuration must be removed or migrated manually before choosing local access only."
+    return 1
+  fi
+  case "$selected" in caddy) other=nginx;; nginx) other=caddy;; none) return 0;; *) return 1;; esac
+  if systemctl is-active --quiet "$other" || [ -s "$(panel_proxy_path "$other")" ]; then
+    warn "${other} already has configuration or is running. Keep that proxy, or migrate it manually before selecting ${selected}."
+    return 1
+  fi
+}
+
+# Snapshot only the owned proxy file; retain a protected backup after failure.
+apply_panel_https() (
+  local domain="$1" proxy="$2" email="$3" subscription="$4"
+  local stage proxy_file old_proxy=0 committed=0 env_changed=0 state_file key
+  check_panel_proxy_choice "$proxy" || return 1
+  stage=$(umask 077; mktemp -d "$PANEL_DIR/.https-backup.XXXXXX") || return 1
+  cp -p "$PANEL_DIR/.env" "$stage/env" || return 1
+  for key in panel auth; do
+    state_file="$PANEL_STATE_FILE"
+    [ "$key" != auth ] || state_file="$PANEL_AUTH_STATE_FILE"
+    [ ! -f "$state_file" ] || cp -p "$state_file" "$stage/$key" || return 1
+  done
+  proxy_file=$(panel_proxy_path "$proxy")
+  if [ -n "$proxy_file" ] && [ -f "$proxy_file" ]; then
+    cp -p "$proxy_file" "$stage/proxy" || return 1
+    old_proxy=1
+  fi
+  rollback_panel_https() {
+    local status=$? rollback_ok=1
+    local OPERATION_ACTIVE=0
+    if [ "$committed" = 0 ]; then
+      cp -p "$stage/env" "$PANEL_DIR/.env" || rollback_ok=0
+      for key in panel auth; do
+        state_file="$PANEL_STATE_FILE"
+        [ "$key" != auth ] || state_file="$PANEL_AUTH_STATE_FILE"
+        if [ -f "$stage/$key" ]; then cp -p "$stage/$key" "$state_file" || rollback_ok=0; else rm -f -- "$state_file" || rollback_ok=0; fi
+      done
+      if [ -n "$proxy_file" ]; then
+        if [ "$old_proxy" = 1 ]; then cp -p "$stage/proxy" "$proxy_file" || rollback_ok=0; else rm -f -- "$proxy_file" || rollback_ok=0; fi
+        systemctl reload "$proxy" >/dev/null 2>&1 || rollback_ok=0
+      fi
+      if [ "$env_changed" = 1 ]; then start_panel_stack >/dev/null 2>&1 || rollback_ok=0; fi
+      if [ "$rollback_ok" = 1 ]; then
+        warn "HTTPS changes rolled back. Backup: ${stage}. Correct the draft and retry Panel HTTPS setup."
+      else
+        warn "HTTPS setup failed and rollback needs attention. Previous files: ${stage}. Check Panel -> Logs and the proxy before continuing."
+      fi
+    fi
+    exit "$status"
+  }
+  trap rollback_panel_https EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cp -p "$stage/env" "$stage/env.new" || return 1
+  set_env_value "$stage/env.new" FRONT_END_DOMAIN "$domain" || return 1
+  set_env_value "$stage/env.new" PANEL_DOMAIN "$domain" || return 1
+  mv -f "$stage/env.new" "$PANEL_DIR/.env" || return 1
+  env_changed=1
+  start_panel_stack || return 1
+  configure_panel_reverse_proxy "$domain" "$proxy" "$email" || return 1
+  operation_set_step 'Verify public Panel access' 'Panel -> Configure domain / HTTPS can repair DNS, certificate and proxy settings.'
+  check_panel_url "$domain" "$proxy" || return 1
+  save_panel_state "$domain" "$proxy" "$email" "$subscription" || return 1
+  local base="https://${domain}"
+  [ "$proxy" != none ] || base=http://127.0.0.1:3000
+  remember_panel_auth "$base" || return 1
+  committed=1
+  rm -f -- "${PANEL_STATE_FILE}.draft"
+)
+
+reconfigure_panel_https() {
+  validate_panel_v3 || return 1
+  panel_setup_preferences no || return $?
+  check_domain_dns "$PANEL_DOMAIN" || return $?
+  apply_panel_https "$PANEL_DOMAIN" "$WEBSERVER" "$LETSENCRYPT_EMAIL" "$SUBSCRIPTION_DOMAIN" || return $?
+  print_panel_summary "$PANEL_DOMAIN" "$WEBSERVER" "$SUBSCRIPTION_DOMAIN"
+}
+
+resume_panel_setup() {
+  local status register_allowed base
+  load_panel_state
+  if [ ! -e "$PANEL_DIR/.env" ] && [ ! -L "$PANEL_DIR/.env" ] &&
+    [ ! -e "$PANEL_DIR/docker-compose.yml" ] && [ ! -L "$PANEL_DIR/docker-compose.yml" ]; then
+    install_panel
+    return $?
+  fi
+  if [ ! -f "$PANEL_DIR/.env" ] || [ -L "$PANEL_DIR/.env" ] ||
+    [ ! -f "$PANEL_DIR/docker-compose.yml" ] || [ -L "$PANEL_DIR/docker-compose.yml" ]; then
+    warn "Panel configuration is incomplete. Restore the missing original file from backup; existing secrets were preserved."
+    return 1
+  fi
+  validate_panel_v3 || return 1
+  # Inspect reality, not a saved completed flag.
+  if ! check_panel_url "${PANEL_DOMAIN:-}" none 1 0; then
+    start_panel_stack || return 1
+  fi
+  if [ -z "${PANEL_DOMAIN:-}" ] || [ -z "${WEBSERVER:-}" ]; then
+    reconfigure_panel_https || return $?
+    load_panel_state
+  elif ! check_panel_url "$PANEL_DOMAIN" "$WEBSERVER" 1 0; then
+    note "Panel backend responds, but public access needs repair."
+    reconfigure_panel_https || return $?
+    load_panel_state
+  fi
+  base="https://${PANEL_DOMAIN}"
+  [ "$WEBSERVER" != none ] || base=http://127.0.0.1:3000
+  status=$(curl -fsS --connect-timeout 5 --max-time 15 -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-For: 127.0.0.1' "${base}/api/auth/status") || return 1
+  register_allowed=$(printf '%s' "$status" | jq -r '.response.isRegisterAllowed | if type == "boolean" then tostring else empty end') || return 1
+  case "$register_allowed" in
+    true) if confirm "Create the missing Panel admin now?"; then create_panel_admin "$base" || return $?; fi;;
+    false) ok "Panel admin already exists.";;
+    *) warn "Cannot determine administrator registration state."; return 1;;
+  esac
+  if [ ! -f "$PANEL_DIR/docker-compose.subscription.yml" ]; then
+    if confirm "Configure the missing subscription page now?"; then setup_subscription_page_for_panel "${SUBSCRIPTION_DOMAIN:-}" || return $?; fi
+  else
+    if ! check_subscription_page_url "${SUBSCRIPTION_DOMAIN:-}" "$WEBSERVER" 1 0; then
+      warn "Subscription configuration exists but its endpoint is not ready. Use Panel -> Start and Panel -> Logs to investigate; its API token was preserved."
       return 1
     fi
-    validate_panel_v3 || { warn "Existing Panel configuration needs repair; files and secrets were preserved."; return 1; }
-    note "Panel files already exist in ${PANEL_DIR}."
-    note "Use Panel -> Start, Create Panel admin, or Configure subscription page to finish setup."
-    return 0
+    note "Existing subscription page responds; keeping its configuration and API token."
   fi
+  check_panel_url "$PANEL_DOMAIN" "$WEBSERVER" || return 1
+  print_panel_summary "$PANEL_DOMAIN" "$WEBSERVER" "${SUBSCRIPTION_DOMAIN:-}"
+}
 
-  ask_validated "Panel domain, for example panel.example.com" panel_domain validate_domain "Enter a valid domain without https:// or a path." || return $?
-
-  subscription_domain_default="$(default_subscription_domain "$panel_domain")"
-
-  while true; do
-    ask_validated "Subscription page domain, for example sub.example.com" subscription_domain validate_domain "Enter a valid domain without https:// or a path." "$subscription_domain_default" || return $?
-    [ "$subscription_domain" = "$panel_domain" ] || break
-    warn "Subscription page domain must be different from Panel domain. Try again."
-  done
-
-  install_prerequisites
-
-  section "DNS check"
-
-  check_domain_dns "$panel_domain"
-  check_domain_dns "$subscription_domain"
-
-  ask "Email for Let's Encrypt/Caddy (can be empty)" letsencrypt_email ""
-
-  menu_title "Select reverse proxy for Panel"
-  menu_item 1 "Caddy, automatic certificate"
-  menu_item 2 "NGINX + Certbot"
-  menu_item 3 "Do not configure reverse proxy"
-
-  blank
-
-  ask_choice "Selection" webserver_choice 1 3 "1" || return $?
-
-  case "$webserver_choice" in
-    1) webserver="caddy" ;;
-    2) webserver="nginx" ;;
-    3) webserver="none" ;;
-  esac
-
-  section "Panel files"
-  prepare_new_panel_files "$panel_domain" "$subscription_domain" || return $?
-  cd "$PANEL_DIR" || return 1
-
-  note "If reverse proxy configuration fails, containers will remain stopped or partially started in ${PANEL_DIR}."
-
-  section "Reverse proxy"
-
-  save_panel_state "$panel_domain" "$webserver" "$letsencrypt_email" "$subscription_domain"
-  configure_panel_reverse_proxy "$panel_domain" "$webserver" "$letsencrypt_email"
-
-  section "Panel startup"
-
-  if ! start_panel_stack; then
-    run_cmd_stream "Show compose status after Panel startup failure" docker compose ps || true
-    run_cmd_stream "Show recent Panel logs after startup failure" docker compose logs --tail=80 remnawave remnawave-db remnawave-redis || true
-
-    die "Remnawave Panel API did not start. Fix the errors above and retry installation/start."
+install_panel() {
+  section "Install or continue Remnawave Panel"
+  if [ -e "$PANEL_DIR/.env" ] || [ -L "$PANEL_DIR/.env" ] || [ -e "$PANEL_DIR/docker-compose.yml" ] || [ -L "$PANEL_DIR/docker-compose.yml" ]; then
+    resume_panel_setup
+    return $?
   fi
-
-  section "Panel access check"
-
-  check_panel_url "$panel_domain" "$webserver" || die "Panel access check failed."
-
-  ok "Panel installed in ${PANEL_DIR}."
-
-  if [ "$webserver" = "none" ]; then
-    note "Reverse proxy is not configured. Do not expose APP_PORT directly to the public internet."
-  else
-    ok "Panel should be available at https://${panel_domain}"
-  fi
-
-  if confirm "Create Panel admin now?"; then
-    section "Panel admin"
-
-    local admin_base="https://${panel_domain}"
-    [ "$webserver" != "none" ] || admin_base="http://127.0.0.1:3000"
-    if ! create_panel_admin "$admin_base"; then
-      note "Panel is installed. Retry admin creation from Panel -> Create Panel admin."
-      return 0
-    fi
-  else
-    skip "Panel admin creation skipped by user."
-  fi
-
-  print_panel_summary "$panel_domain" "$webserver" "$subscription_domain"
-
-  if confirm "Configure remnawave-subscription-page now?"; then
-    section "Subscription page"
-
-    setup_subscription_page_for_panel "$subscription_domain"
-  else
-    skip "remnawave-subscription-page configuration skipped by user."
-  fi
+  panel_setup_preferences || return $?
+  install_prerequisites || return $?
+  check_domain_dns "$PANEL_DOMAIN" || return $?
+  check_domain_dns "$SUBSCRIPTION_DOMAIN" || return $?
+  prepare_new_panel_files "$PANEL_DOMAIN" "$SUBSCRIPTION_DOMAIN" || return $?
+  # Save choices before startup/HTTPS can fail, enabling continuation after interruption.
+  save_panel_state "$PANEL_DOMAIN" "$WEBSERVER" "$LETSENCRYPT_EMAIL" "$SUBSCRIPTION_DOMAIN" || return 1
+  apply_panel_https "$PANEL_DOMAIN" "$WEBSERVER" "$LETSENCRYPT_EMAIL" "$SUBSCRIPTION_DOMAIN" || return $?
+  resume_panel_setup
 }
 
 create_admin_for_existing_panel() {
@@ -2685,7 +3168,7 @@ panel_api_token_is_valid() {
 
   response_file="$(mktemp)"
 
-  http_code=$(curl -sS -o "$response_file" -w "%{http_code}" -X GET "${panel_base%/}/api/config-profiles" \
+  http_code=$(curl -sS --connect-timeout 5 --max-time 30 -o "$response_file" -w "%{http_code}" -X GET "${panel_base%/}/api/config-profiles" \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
     -H "X-Forwarded-For: ${panel_base#http://}" \
@@ -2706,7 +3189,7 @@ login_panel_and_get_token() {
 
   printf -v "$token_var" '%s' ''
   response_file="$(mktemp)" || return 1
-  http_code=$(curl -sS -o "$response_file" -w "%{http_code}" -X POST "${panel_base%/}/api/auth/login" \
+  http_code=$(curl -sS --connect-timeout 5 --max-time 30 -o "$response_file" -w "%{http_code}" -X POST "${panel_base%/}/api/auth/login" \
     -H "Content-Type: application/json" \
     -H "X-Forwarded-Proto: https" \
     -H "X-Forwarded-For: 127.0.0.1" \
@@ -2729,6 +3212,7 @@ login_panel_and_get_token() {
 
 get_panel_api_token() {
   local panel_base="$1" token_var="$2"
+  local OPERATION_ACTIVE=0
   local api_token="" username="" password="" auth_choice answer_status
   local default_username=""
 
@@ -2736,7 +3220,7 @@ get_panel_api_token() {
   if [ -n "${PANEL_AUTH_TOKEN:-}" ]; then
     answer_status=0
     confirm "Use previously saved Panel API/access token for ${panel_base}?" || answer_status=$?
-    [ "$answer_status" -ne 130 ] || return 130
+    [ "$answer_status" -lt 130 ] || return "$answer_status"
     if [ "$answer_status" -eq 0 ]; then
       if panel_api_token_is_valid "$panel_base" "$PANEL_AUTH_TOKEN"; then
         ok "Using previously saved Panel API/access token."
@@ -2751,7 +3235,7 @@ get_panel_api_token() {
   if [ -n "${PANEL_AUTH_USERNAME:-}" ] && [ -n "${PANEL_AUTH_PASSWORD:-}" ]; then
     answer_status=0
     confirm "Use previously saved Panel login/password for ${panel_base}?" || answer_status=$?
-    [ "$answer_status" -ne 130 ] || return 130
+    [ "$answer_status" -lt 130 ] || return "$answer_status"
     if [ "$answer_status" -eq 0 ]; then
       if login_panel_and_get_token "$panel_base" "$PANEL_AUTH_USERNAME" "$PANEL_AUTH_PASSWORD" api_token; then
         if panel_api_token_is_valid "$panel_base" "$api_token"; then
@@ -2770,18 +3254,18 @@ get_panel_api_token() {
     menu_title "Panel API auth"
     menu_item 1 "Paste existing API/access token"
     menu_item 2 "Panel login/password"
-    menu_item 0 "Cancel / back"
+    menu_item 0 "Back to Panel URL"
     blank
-    ask_choice "Selection" auth_choice 0 2 "1" || return 130
+    ask_choice "Selection" auth_choice 0 2 "1" || return $?
     case "$auth_choice" in
-      0) return 130 ;;
+      0) return 131 ;;
       1)
-        ask_secret_required "Panel API/access token" api_token || return 130
+        ask_secret_required "Panel API/access token" api_token || return $?
         ;;
       2)
-        ask_required "Panel username" username "$default_username" || return 130
+        ask_required "Panel username" username "$default_username" || return $?
         default_username="$username"
-        ask_secret_required "Panel password" password || return 130
+        ask_secret_required "Panel password" password || return $?
         if ! login_panel_and_get_token "$panel_base" "$username" "$password" api_token; then continue; fi
         ;;
     esac
@@ -2796,6 +3280,24 @@ get_panel_api_token() {
     fi
     printf -v "$token_var" '%s' "$api_token"
     return 0
+  done
+}
+
+ask_panel_auth() {
+  local __panel_auth_base="${3:-}" __panel_auth_token="" __panel_auth_status=0
+  while true; do
+    ask_validated "Panel URL" __panel_auth_base validate_url "Enter an HTTP(S) URL without credentials, query or fragment." "$__panel_auth_base" || return $?
+    __panel_auth_base="${__panel_auth_base%/}"
+    __panel_auth_status=0
+    get_panel_api_token "$__panel_auth_base" __panel_auth_token || __panel_auth_status=$?
+    case "$__panel_auth_status" in
+      0)
+        printf -v "$1" '%s' "$__panel_auth_base"
+        printf -v "$2" '%s' "$__panel_auth_token"
+        return 0 ;;
+      131) continue ;;
+      *) return "$__panel_auth_status" ;;
+    esac
   done
 }
 
@@ -2983,7 +3485,7 @@ setup_subscription_page_for_panel() {
 
   default_panel_base="$(default_panel_api_base)"
 
-  ask_required "Panel API base URL" panel_base "$default_panel_base"
+  ask_panel_auth panel_base token "$default_panel_base" || return $?
 
   panel_domain="${PANEL_DOMAIN:-}"
   if [ -z "$panel_domain" ]; then
@@ -3033,11 +3535,9 @@ setup_subscription_page_for_panel() {
     check_domain_dns "$subscription_domain"
 
     if [ -z "$letsencrypt_email" ]; then
-      ask "Email for Let's Encrypt/Caddy (can be empty)" letsencrypt_email ""
+      ask_validated "Email for Let's Encrypt/Caddy (can be empty)" letsencrypt_email validate_optional_email "Enter a valid email or leave it empty." || return $?
     fi
   fi
-
-  get_panel_api_token "$panel_base" token
 
   cd "$PANEL_DIR"
 
@@ -3115,9 +3615,7 @@ install_node() {
   if confirm "Create and add this Node in Panel automatically?"; then
     default_panel_base="$(default_panel_api_base)"
 
-    ask_required "Panel API base URL" panel_base "$default_panel_base"
-
-    get_panel_api_token "$panel_base" token
+    ask_panel_auth panel_base token "$default_panel_base" || return $?
 
     ask_required "Node name" node_name "node-1"
 
@@ -3341,7 +3839,7 @@ remove_stack_with_volumes() {
 
   note "Full removal of ${name} with Docker volumes."
 
-  ask_delete_confirmation answer || return 130
+  ask_delete_confirmation answer || return $?
 
   [ "$answer" = "DELETE" ] || { note "Removal cancelled."; return 130; }
 
@@ -3361,6 +3859,219 @@ remove_stack_with_volumes() {
 }
 
 # STACK_REMOVAL END
+
+# DIAGNOSTICS BEGIN
+
+# Only allowlisted facts enter reports. Never collect environment, raw logs, or
+# unrestricted inspect output. All subprocess probes have a deadline.
+diagnostic_run() {
+  command -v timeout >/dev/null 2>&1 || return 1
+  timeout 3 "$@" 2>/dev/null
+}
+
+diagnostic_domain() {
+  local value="${1:-}"
+  if [[ "$value" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && [[ "$value" == *.* ]] && [ "${#value}" -le 253 ]; then
+    printf '%s' "$value"
+  fi
+}
+
+diagnostic_snapshot() {
+  DIAG_DOCKER=unknown
+  DIAG_CONTAINERS=""
+  if ! command -v docker >/dev/null 2>&1; then DIAG_DOCKER=unavailable; return 0; fi
+  # A successful list distinguishes absent containers from an unreachable daemon.
+  if DIAG_CONTAINERS="$(diagnostic_run docker ps -a --format '{{.Names}}|{{.State}}|{{.Status}}|{{.Image}}')"; then
+    DIAG_DOCKER=available
+  fi
+}
+
+diagnostic_container() {
+  local wanted="$1" name state health image
+  if [ "$DIAG_DOCKER" != available ]; then printf 'unknown (Docker %s)' "$DIAG_DOCKER"; return; fi
+  while IFS='|' read -r name state health image; do
+    [ "$name" = "$wanted" ] || continue
+    case "$state" in
+      running)
+        case "$health" in
+          *'(unhealthy)'*) printf 'running / unhealthy' ;;
+          *'(healthy)'*) printf 'running / healthy' ;;
+          *'(health: starting)'*) printf 'running / health starting' ;;
+          *) printf 'running / health not reported' ;;
+        esac ;;
+      exited|dead|created|paused|restarting|removing) printf '%s' "$state" ;;
+      *) printf 'unknown' ;;
+    esac
+    return
+  done <<< "$DIAG_CONTAINERS"
+  printf 'absent'
+}
+
+diagnostic_image() {
+  local name state health image
+  while IFS='|' read -r name state health image; do
+    [ "$name" = remnawave ] || continue
+    if [[ "$image" =~ ^(ghcr.io/)?remnawave/backend:[a-zA-Z0-9._-]+$ ]]; then
+      printf '%s (image tag; exact runtime version not verified)' "${image##*:}"
+      return
+    fi
+  done <<< "$DIAG_CONTAINERS"
+  printf 'unknown'
+}
+
+diagnostic_certificate() {
+  local domain="$1" file expiry candidate
+  [ -n "$domain" ] || { printf 'unknown (no domain)'; return; }
+  file="/etc/letsencrypt/live/${domain}/fullchain.pem"
+  if [ ! -r "$file" ]; then
+    for candidate in /var/lib/caddy/.local/share/caddy/certificates/*/"$domain"/"$domain.crt"; do
+      [ -r "$candidate" ] || continue
+      file="$candidate"
+      break
+    done
+  fi
+  if [ -r "$file" ] && command -v openssl >/dev/null 2>&1; then
+    expiry="$(diagnostic_run openssl x509 -in "$file" -noout -enddate || true)"
+    if [[ "$expiry" =~ ^notAfter=([A-Za-z]{3}[[:space:]]+[0-9]{1,2}[[:space:]][0-9:]{8}[[:space:]][0-9]{4}[[:space:]]GMT)$ ]]; then
+      printf '%s' "${BASH_REMATCH[1]}"
+      if ! diagnostic_run openssl x509 -in "$file" -noout -checkend 604800 >/dev/null; then
+        printf ' (expired or expires within 7 days; check renewal)'
+      fi
+      return
+    fi
+  fi
+  printf 'unknown (local certificate unavailable; use diagnostics for HTTPS)'
+}
+
+diagnostic_latest_backup() {
+  local record="$STATE_DIR/last-backup.status" key value status='' timestamp='' archive='' latest='' candidate
+  if [ -f "$record" ] && [ ! -L "$record" ]; then
+    while IFS='=' read -r key value; do
+      case "$key" in status) status="$value";; timestamp) timestamp="$value";; archive) archive="$value";; esac
+    done < "$record"
+    if [ "$status" = success ] && [[ "$timestamp" =~ ^[0-9]{1,12}$ ]] &&
+      [ "${archive%/*}" = "$BACKUP_ROOT" ] && [[ "${archive##*/}" =~ ^remnawave-backup-[a-zA-Z0-9.-]+\.tar\.gz$ ]]; then
+      if [ -f "$archive" ] && [ ! -L "$archive" ]; then
+        printf '%s (verified when created)' "$(date -d "@$timestamp" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || printf 'recorded success')"
+      else
+        printf 'last successful archive is missing; create a new backup'
+      fi
+      return
+    fi
+  fi
+  for candidate in "$BACKUP_ROOT"/remnawave-backup-*.tar.gz; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    [[ "${candidate##*/}" =~ ^remnawave-backup-[a-zA-Z0-9.-]+\.tar\.gz$ ]] || continue
+    if [ -z "$latest" ] || [ "$candidate" -nt "$latest" ]; then latest="$candidate"; fi
+  done
+  if [ -n "$latest" ]; then
+    printf '%s (verification not recorded; use Verify backup)' "${latest##*/}"
+  else
+    printf 'none'
+  fi
+}
+
+show_dashboard() (
+  load_panel_state
+  local domain name
+  domain="$(diagnostic_domain "${PANEL_DOMAIN:-}")"
+  diagnostic_snapshot
+  if [ "${WEBSERVER:-}" = none ]; then
+    printf '\nPanel: http://127.0.0.1:3000 (local access)\n'
+  else
+    printf '\nPanel: %s\n' "${domain:+https://$domain}"
+    [ -n "$domain" ] || printf 'Panel URL not configured.\n'
+  fi
+  printf 'Installed backend: %s\n' "$(diagnostic_image)"
+  for name in remnawave remnawave-db remnawave-redis remnawave-subscription-page remnanode; do
+    printf '  %s: %s\n' "$name" "$(diagnostic_container "$name")"
+  done
+  if [ "${WEBSERVER:-}" != none ]; then printf 'Certificate expiry: %s\n' "$(diagnostic_certificate "$domain")"; fi
+  printf 'Latest backup: %s\n' "$(diagnostic_latest_backup)"
+)
+
+diagnostic_http() {
+  local status
+  if ! command -v curl >/dev/null 2>&1; then printf 'unknown'; return; fi
+  if ! status="$(diagnostic_run curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 2 "$@")"; then status=000; fi
+  [[ "$status" =~ ^[0-9]{3}$ ]] || status=000
+  printf '%s' "$status"
+}
+
+diagnose_installation() (
+  load_panel_state
+  local domain subscription local_status public_status name state dns disk listeners port listeners_known=0 disk_path
+  domain="$(diagnostic_domain "${PANEL_DOMAIN:-}")"
+  subscription="$(diagnostic_domain "${SUBSCRIPTION_DOMAIN:-}")"
+  printf 'Read-only diagnostics (HTTP 000 = connection/TLS failure; unknown = unavailable probe)\n'
+  show_dashboard
+  diagnostic_snapshot
+  for name in remnawave remnawave-db remnawave-redis remnawave-subscription-page; do
+    state="$(diagnostic_container "$name")"
+    case "$state" in
+      absent) printf 'Hint: %s is absent; check whether that component was installed.\n' "$name" ;;
+      exited|dead|paused|created|*unhealthy*) printf 'Hint: %s needs attention; inspect its service logs and configuration.\n' "$name" ;;
+    esac
+  done
+  local_status="$(diagnostic_http -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-For: 127.0.0.1' http://127.0.0.1:3000/api/auth/status)"
+  printf 'Local backend API HTTP: %s\n' "$local_status"
+  if [ -n "$domain" ] && [ "${WEBSERVER:-}" != none ]; then
+    dns="$(diagnostic_run getent ahostsv4 "$domain" | awk '{print $1}' | sort -u || true)"
+    if [ -n "$dns" ]; then
+      printf 'Panel DNS IPv4:'
+      while read -r state; do [[ "$state" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && printf ' %s' "$state"; done <<< "$dns"
+      printf '\nCompare these addresses with the server public IP or intended CDN/proxy.\n'
+    else printf 'Panel DNS: unresolved or lookup unavailable; check the A/AAAA records.\n'; fi
+    public_status="$(diagnostic_http "https://${domain}/api/auth/status")"
+    printf 'Public backend HTTPS (certificate verification enabled): %s\n' "$public_status"
+    if [[ "$local_status" =~ ^2[0-9]{2}$ ]] && ! [[ "$public_status" =~ ^2[0-9]{2}$ ]]; then
+      printf 'Hint: local API works but public API does not; check DNS, reverse proxy, certificate and ports 80/443.\n'
+    fi
+  fi
+  if [[ "$(diagnostic_container remnawave-db)" == running* ]]; then
+    if diagnostic_run docker exec remnawave-db pg_isready -q >/dev/null; then
+      printf 'Database: accepting connections (authentication not tested)\n'
+    else printf 'Database readiness: failed or probe unavailable; inspect database service logs.\n'; fi
+  fi
+  if [[ "$(diagnostic_container remnawave-subscription-page)" == running* ]]; then
+    if diagnostic_run docker exec remnawave-subscription-page curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:3010/internal/health >/dev/null; then
+      printf 'Subscription internal health: passed\n'
+    else printf 'Subscription internal health: failed or probe unavailable\n'; fi
+  fi
+  if [ -n "$subscription" ] && [ "${WEBSERVER:-}" != none ]; then
+    printf 'Subscription public HTTPS root (not an end-to-end subscription test): %s\n' "$(diagnostic_http "https://${subscription}/")"
+  fi
+  if listeners="$(diagnostic_run ss -H -ltn)"; then listeners_known=1; fi
+  for port in 80 443 3000; do
+    if [ "$listeners_known" = 0 ]; then state=unknown
+    elif awk -v p=":$port" '$4 ~ (p "$") {found=1} END {exit !found}' <<< "$listeners"; then state=listening
+    else state='not listening'; fi
+    printf 'TCP port %s: %s (external firewall not tested)\n' "$port" "$state"
+  done
+  disk_path="$PANEL_DIR"
+  while [ ! -d "$disk_path" ] && [ "$disk_path" != / ]; do disk_path="$(dirname "$disk_path")"; done
+  disk="$(diagnostic_run df -Pk "$disk_path" 2>/dev/null | awk 'NR==2 {print $5}' || true)"
+  if [[ "$disk" =~ ^[0-9]+%$ ]]; then
+    printf 'Panel filesystem used: %s\n' "$disk"
+    if [ "${disk%%%}" -ge 90 ]; then printf 'Hint: free disk space before updating or backing up.\n'; fi
+  else printf 'Panel filesystem used: unknown\n'; fi
+)
+
+export_diagnostic_report() (
+  local report
+  umask 077
+  mkdir -p "${STATE_DIR}/reports" || return 1
+  chmod 700 "${STATE_DIR}/reports" || return 1
+  report="$(mktemp "${STATE_DIR}/reports/diagnostics-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX.txt")" || return 1
+  chmod 600 "$report" || return 1
+  if ! diagnose_installation > "$report"; then
+    printf 'Diagnostic collection incomplete.\n' >> "$report"
+  fi
+  if declare -F operation_report_last >/dev/null; then operation_report_last >> "$report"; fi
+  printf 'Diagnostic report saved: %s\n' "$report"
+)
+
+# DIAGNOSTICS END
 
 # SYSTEM BEGIN
 
@@ -3860,7 +4571,7 @@ add_warp_to_config_profile() {
 
   default_panel_base="$(default_panel_api_base)"
 
-  ask_required "Panel API base URL" panel_base "$default_panel_base"
+  ask_panel_auth panel_base token "$default_panel_base" || return $?
 
   if ! ip link show warp >/dev/null 2>&1; then
     warn "Interface 'warp' is not available right now."
@@ -3872,7 +4583,6 @@ add_warp_to_config_profile() {
     }
   fi
 
-  get_panel_api_token "$panel_base" token
   select_config_profile "$panel_base" "$token" profile_uuid profile_name config_json
 
   if printf "%s\n" "$config_json" | jq -e '.outbounds[]? | select(.tag == "warp-out")' >/dev/null 2>&1; then
@@ -3923,9 +4633,7 @@ remove_warp_from_config_profile() {
 
   default_panel_base="$(default_panel_api_base)"
 
-  ask_required "Panel API base URL" panel_base "$default_panel_base"
-
-  get_panel_api_token "$panel_base" token
+  ask_panel_auth panel_base token "$default_panel_base" || return $?
   select_config_profile "$panel_base" "$token" profile_uuid profile_name config_json
 
   config_json=$(printf "%s\n" "$config_json" | jq '
@@ -3949,12 +4657,92 @@ remove_warp_from_config_profile() {
 
 # MENUS BEGIN
 
+operation_action_id() {
+  case "$1" in
+    install_panel|resume_panel_setup|reconfigure_panel_https|install_node|install_panel_node|create_admin_for_existing_panel|setup_subscription_page_for_panel|update_panel|update_node|reinstall_panel_keep_config|reinstall_node_keep_config|remove_panel|remove_panel_with_volumes|remove_stack|remove_stack_with_volumes|backup_all|restore_backup|configure_backup_schedule|issue_cloudflare_wildcard_cert|issue_gcore_wildcard_cert|renew_certificates_dry_run|setup_certbot_auto_renew|remove_certbot_renew_cron|install_warp_native|enable_warp_native|disconnect_warp|remove_warp|add_warp_to_config_profile|remove_warp_from_config_profile|disable_ipv6|enable_ipv6)
+      printf '%s' "$1" ;;
+    compose_action)
+      case "${3:-}" in start|stop|restart) printf 'compose_%s' "$3" ;; *) printf 'inspection' ;; esac ;;
+    *) printf 'operation' ;;
+  esac
+}
+
+operation_recovery_hint() {
+  case "$1" in
+    install_panel|install_panel_node|resume_panel_setup) printf 'Install -> Continue Panel setup checks completed steps before continuing.' ;;
+    reconfigure_panel_https) printf 'Panel -> Configure domain / HTTPS lets you repair the domain, email or certificate.' ;;
+    create_admin_for_existing_panel) printf 'Panel -> Create Panel admin can be retried without reinstalling.' ;;
+    setup_subscription_page_for_panel) printf 'Panel -> Configure subscription page can finish this step separately.' ;;
+    restore_backup) printf 'Check the restore error before starting services. Backup / Restore -> Verify backup can check the archive.' ;;
+    backup_all|configure_backup_schedule) printf 'Use Backup / Restore to check the archive and schedule; a failed backup must not be used for recovery.' ;;
+    *) printf 'Use System -> Diagnose installation to check the cause before retrying this menu action.' ;;
+  esac
+}
+
+operation_write_status() (
+  [ "${OPERATION_TRACKING_ENABLED:-0}" = 1 ] || return 0
+  local status="$1" exit_code="$2" temporary
+  umask 077
+  mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR" || return 1
+  temporary="$(mktemp "$STATE_DIR/.operation.XXXXXX")" || return 1
+  {
+    printf 'id=%s\naction=%s\nstatus=%s\nexit_code=%s\nupdated=%s\n' "$OPERATION_ID" "$OPERATION_ACTION" "$status" "$exit_code" "$(date +%s)"
+    printf 'step=%s\nhint=%s\n' "${OPERATION_STEP:-}" "${OPERATION_HINT:-}" | tr -d '\r'
+  } > "$temporary" || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$STATE_DIR/last-operation" || { rm -f -- "$temporary"; return 1; }
+)
+
+operation_set_step() {
+  [ "${OPERATION_ACTIVE:-0}" = 1 ] || return 0
+  OPERATION_STEP="$(printf '%s' "$1" | tr -d '\000-\037\177')"
+  if [ "$#" -ge 2 ]; then OPERATION_HINT="$(printf '%s' "$2" | tr -d '\000-\037\177')"; fi
+  operation_write_status running 0 || true
+}
+
+operation_read_field() {
+  [ -f "$STATE_DIR/last-operation" ] && [ ! -L "$STATE_DIR/last-operation" ] || return 0
+  LC_ALL=C awk -v key="$1" 'index($0,key "=")==1 {print substr($0,length(key)+2); exit}' "$STATE_DIR/last-operation"
+}
+
+# Export only validated metadata. Step descriptions and log text may contain input.
+operation_report_last() {
+  local action status code updated
+  action="$(operation_read_field action)"
+  status="$(operation_read_field status)"
+  code="$(operation_read_field exit_code)"
+  updated="$(operation_read_field updated)"
+  case "$action" in compose_start|compose_stop|compose_restart) ;; *) action="$(operation_action_id "${action:-unknown}")" ;; esac
+  case "$status" in running|success|failed|cancelled|back) ;; *) status=unknown ;; esac
+  [[ "$code" =~ ^[0-9]{1,3}$ ]] || code=unknown
+  [[ "$updated" =~ ^[0-9]{1,12}$ ]] || updated=unknown
+  printf 'last_action=%s\nlast_status=%s\nlast_exit_code=%s\nlast_updated=%s\n' "$action" "$status" "$code" "$updated"
+}
+
+operation_finish() {
+  local code="$1" status
+  # A subshell may have recorded a more precise step than its parent shell knows.
+  if [ "${OPERATION_TRACKING_ENABLED:-0}" = 1 ] && [ "$(operation_read_field id)" = "$OPERATION_ID" ]; then
+    OPERATION_STEP="$(operation_read_field step)"
+    OPERATION_HINT="$(operation_read_field hint)"
+  fi
+  case "$code" in 0) status=success ;; 130) status=cancelled ;; 131) status=back ;; *) status=failed ;; esac
+  operation_write_status "$status" "$code" || true
+}
+
 # Call this and its enclosing menus as simple commands, never in if/! or ||.
 # Testing a Bash function's status would disable errexit throughout its body.
 run_menu_action() {
   local action_status
   local restore_errexit=0
   local previous_int_trap
+  local tracking_enabled="${OPERATION_TRACKING_ENABLED:-0}"
+  local action_id action_hint operation_id="${BASHPID}.${RANDOM}.${RANDOM}"
+  action_id="$(operation_action_id "$@")"
+  action_hint="$(operation_recovery_hint "$action_id")"
+  case "$1" in
+    diagnose_installation|export_diagnostic_report|show_backup_schedule|list_backups|verify_backup|status_all|show_warp_status|list_certificates|show_support_creator) tracking_enabled=0 ;;
+    compose_action) [ "$action_id" != inspection ] || tracking_enabled=0 ;;
+  esac
   [[ "$-" != *e* ]] || restore_errexit=1
   previous_int_trap="$(trap -p INT)"
 
@@ -3962,6 +4750,14 @@ run_menu_action() {
   set +e
   (
     set -Eeuo pipefail
+    OPERATION_ACTIVE=1
+    OPERATION_TRACKING_ENABLED="$tracking_enabled"
+    OPERATION_ID="$operation_id"
+    OPERATION_ACTION="$action_id"
+    OPERATION_STEP="${action_id//_/ }"
+    OPERATION_HINT="$action_hint"
+    operation_write_status running 0 || true
+    trap 'operation_finish "$?"' EXIT
     trap 'exit 130' INT
     "$@"
   )
@@ -3976,9 +4772,18 @@ run_menu_action() {
   case "$action_status" in
     0) ;;
     130) note "Operation cancelled. Returning to the menu." ;;
+    131) note "Returning to the previous menu." ;;
     *)
       warn "Operation stopped (exit ${action_status}). See the error above or ${LOG_FILE}."
-      note "Returning to the menu. Completed steps are preserved; retry the failed operation when ready."
+      if [ "$tracking_enabled" = 1 ] && [ "$(operation_read_field id)" = "$operation_id" ]; then
+        local failed_step saved_hint
+        failed_step="$(operation_read_field step)"
+        saved_hint="$(operation_read_field hint)"
+        [ -z "$saved_hint" ] || action_hint="$saved_hint"
+        [ -z "$failed_step" ] || printf '  Stopped at: %s\n' "$failed_step"
+      fi
+      note "Completed changes remain in place; later steps were not run."
+      printf '  Next: %s\n' "$action_hint"
       ;;
   esac
   return 0
@@ -3986,6 +4791,8 @@ run_menu_action() {
 
 show_main_menu() {
   menu_title "Remnawave installer ${SCRIPT_VERSION}"
+  show_dashboard || note "Dashboard unavailable. System -> Diagnose installation can check the cause."
+  micro "At prompts: /back returns to the previous step, /cancel returns to the menu."
   menu_item 1 "Install"
   menu_item 2 "Panel"
   menu_item 3 "Node"
@@ -3994,6 +4801,7 @@ show_main_menu() {
   menu_item 6 "Certificates"
   menu_item 7 "Backup / Restore"
   menu_item_accent 8 "Support Creator"
+  menu_item 9 "Diagnose installation"
   menu_item 0 "Exit"
   blank
 }
@@ -4003,6 +4811,7 @@ show_install_menu() {
   menu_item 1 "Install Panel"
   menu_item 2 "Install Node"
   menu_item 3 "Install Panel + Node"
+  menu_item 4 "Continue Panel setup"
   menu_item 0 "Back"
   blank
 }
@@ -4020,6 +4829,8 @@ show_panel_menu() {
   menu_item 9 "Remove with volumes"
   menu_item 10 "Configure subscription page"
   menu_item 11 "Create Panel admin"
+  menu_item 12 "Configure domain / HTTPS"
+  menu_item 13 "Continue Panel setup"
   menu_item 0 "Back"
   blank
 }
@@ -4044,6 +4855,8 @@ show_system_menu() {
   menu_item 1 "Overall status"
   menu_item 2 "Disable IPv6"
   menu_item 3 "Enable IPv6"
+  menu_item 4 "Diagnose installation"
+  menu_item 5 "Export diagnostic report"
   menu_item 0 "Back"
   blank
 }
@@ -4077,6 +4890,10 @@ show_backup_menu() {
   menu_title "Backup / Restore"
   menu_item 1 "Create full backup"
   menu_item 2 "Restore from backup"
+  menu_item 3 "List backups"
+  menu_item 4 "Verify backup"
+  menu_item 5 "Configure automatic backups"
+  menu_item 6 "Show backup schedule"
   menu_item 0 "Back"
   blank
 }
@@ -4141,6 +4958,7 @@ handle_install_menu() {
       1) run_menu_action install_panel ;;
       2) run_menu_action install_node ;;
       3) run_menu_action install_panel_node ;;
+      4) run_menu_action resume_panel_setup ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4165,6 +4983,8 @@ handle_panel_menu() {
       9) run_menu_action remove_panel_with_volumes ;;
       10) run_menu_action setup_subscription_page_for_panel ;;
       11) run_menu_action create_admin_for_existing_panel ;;
+      12) run_menu_action reconfigure_panel_https ;;
+      13) run_menu_action resume_panel_setup ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4203,6 +5023,8 @@ handle_system_menu() {
       1) run_menu_action status_all ;;
       2) run_menu_action disable_ipv6 ;;
       3) run_menu_action enable_ipv6 ;;
+      4) run_menu_action diagnose_installation ;;
+      5) run_menu_action export_diagnostic_report ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4257,6 +5079,10 @@ handle_backup_menu() {
     case "$choice" in
       1) run_menu_action backup_all ;;
       2) run_menu_action restore_backup ;;
+      3) run_menu_action list_backups ;;
+      4) run_menu_action verify_backup ;;
+      5) run_menu_action configure_backup_schedule ;;
+      6) run_menu_action show_backup_schedule ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4268,11 +5094,24 @@ handle_backup_menu() {
 # ENTRYPOINT BEGIN
 
 main() {
+  case "${1:-}" in
+    --scheduled-backup)
+      [ "$#" -eq 1 ] || { printf 'Unexpected arguments.\n' >&2; return 2; }
+      need_root
+      prepare_log
+      run_scheduled_backup
+      return
+      ;;
+    '') ;;
+    *) printf 'Usage: bash remnawave_installer.sh [--scheduled-backup]\n' >&2; return 2 ;;
+  esac
   need_root
 
   check_os
 
   prepare_log
+
+  OPERATION_TRACKING_ENABLED=1
 
   show_startup_support_notice
 
@@ -4292,6 +5131,7 @@ main() {
       6) handle_cert_menu ;;
       7) handle_backup_menu ;;
       8) run_menu_action show_support_creator ;;
+      9) run_menu_action diagnose_installation ;;
       0) exit 0 ;;
       *) warn "Invalid menu item." ;;
     esac
