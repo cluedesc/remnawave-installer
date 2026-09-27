@@ -127,7 +127,7 @@ You can also finish admin creation through **Panel -> Create Panel admin** or su
 
 ### Dashboard and Diagnostics
 
-The main menu shows the Panel URL, backend image tag, container states, local certificate expiry, and the latest backup information. An image tag is not a verified exact runtime version. Failed or unavailable probes are shown as unknown rather than healthy.
+The main menu shows three compact rows for Panel, subscription page, and Node, with the Panel URL alongside its status. Database, Redis, or Docker problems get a separate notice. Detailed container states, backend image tag, certificate expiry, and backup information are available in **Diagnose installation**. An image tag is not a verified exact runtime version. Failed or unavailable probes are shown as unknown rather than healthy. Navigation commands are explained once below the main menu, rather than repeated in every input prompt.
 
 **Diagnose installation** performs bounded, read-only checks of the API, database readiness, subscription health, DNS, HTTPS, listening ports, and disk usage, with suggested next steps. It does not test an external firewall or complete delivery of a user's subscription.
 

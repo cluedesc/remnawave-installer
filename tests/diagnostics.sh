@@ -41,7 +41,10 @@ http_exit=60
 [[ "$(diagnostic_http https://example.test)" = 000 ]] || fail 'TLS failure must override status'
 http_exit=0
 show_dashboard > "$tmp/dashboard"
-grep -q '3.4.4 (image tag' "$tmp/dashboard" || fail 'installed image tag'
+grep -q 'Database needs attention' "$tmp/dashboard" || fail 'database issue hidden in compact status'
+if grep -Eq 'remnawave-db|Installed backend:|Certificate expiry:|Latest backup:' "$tmp/dashboard"; then fail 'technical details in compact status'; fi
+show_status_details > "$tmp/details"
+grep -q '3.4.4 (image tag' "$tmp/details" || fail 'installed image tag'
 mkdir -p "$STATE_DIR"
 printf 'archive\n' > "$BACKUP_ROOT/remnawave-backup-20260101000000-test.tar.gz"
 printf 'status=success\ntimestamp=1767225600\narchive=%s\n' "$BACKUP_ROOT/remnawave-backup-20260101000000-test.tar.gz" > "$STATE_DIR/last-backup.status"
@@ -52,7 +55,7 @@ diagnostic_latest_backup > "$tmp/latest"
 grep -q 'archive is missing' "$tmp/latest" || fail 'missing archive shown as usable'
 WEBSERVER=none
 show_dashboard > "$tmp/dashboard"
-grep -q '127.0.0.1:3000 (local access)' "$tmp/dashboard" || fail 'local-only URL wrong'
+grep -q '127.0.0.1:3000 (local)' "$tmp/dashboard" || fail 'local-only URL wrong'
 unset WEBSERVER
 diagnose_installation > "$tmp/diagnostics"
 grep -q 'TCP port 443: listening' "$tmp/diagnostics" || fail 'listening port'

@@ -363,7 +363,7 @@ ask() {
   local __ask_value=""
 
   if [ -n "$__ask_default_value" ]; then
-    prompt_line "$__ask_prompt (/back: previous, /cancel: exit) "
+    prompt_line "$__ask_prompt "
     prompt_default "[$__ask_default_value]"
 
     printf ": "
@@ -372,7 +372,7 @@ ask() {
 
     __ask_value="${__ask_value:-$__ask_default_value}"
   else
-    prompt_line "$__ask_prompt (/back: previous, /cancel: exit): "
+    prompt_line "$__ask_prompt: "
 
     __ask_value="$(read_input)" || return $?
   fi
@@ -391,7 +391,7 @@ ask_secret() {
 
   local __ask_secret_value=""
 
-  prompt_line "$__ask_secret_prompt (/back: previous, /cancel: exit): "
+  prompt_line "$__ask_secret_prompt: "
 
   local __ask_secret_status=0
   __ask_secret_value="$(read_secret_input)" || __ask_secret_status=$?
@@ -486,7 +486,7 @@ confirm() {
   local answer=""
   local normalized=""
 
-  prompt_line "$prompt (/back: previous, /cancel: exit) "
+  prompt_line "$prompt "
   prompt_default "[y/N]"
 
   printf ": "
@@ -521,7 +521,7 @@ ask_menu_choice() {
   
   local __ask_menu_choice_value=""
 
-  prompt_line "Selection (/back: previous, /cancel: exit): "
+  prompt_line "Selection: "
   __ask_menu_choice_value="$(read_input)" || return $?
   __ask_menu_choice_value="$(printf "%s" "$__ask_menu_choice_value" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
 
@@ -535,7 +535,7 @@ ask_delete_confirmation() {
 
   local __ask_delete_confirmation_value=""
 
-  prompt_line "Type DELETE to confirm (/back: previous, /cancel: exit): "
+  prompt_line "Type DELETE to confirm: "
   __ask_delete_confirmation_value="$(read_input)" || return $?
   __ask_delete_confirmation_value="$(printf "%s" "$__ask_delete_confirmation_value" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
 
@@ -3973,6 +3973,59 @@ diagnostic_latest_backup() {
 
 show_dashboard() (
   load_panel_state
+  local domain address='' index state label color name panel_state
+  local names=(remnawave remnawave-subscription-page remnanode)
+  local labels=(Panel Subscription Node)
+  local configs=("$PANEL_DIR/docker-compose.yml" "$PANEL_DIR/docker-compose.subscription.yml" "$NODE_DIR/docker-compose.yml")
+  local issues=()
+  domain="$(diagnostic_domain "${PANEL_DOMAIN:-}")"
+  if [ "${WEBSERVER:-}" = none ]; then address='http://127.0.0.1:3000 (local)'
+  elif [ -n "$domain" ]; then address="https://$domain"; fi
+  diagnostic_snapshot
+  panel_state="$(diagnostic_container remnawave)"
+  printf '\n'
+  for index in "${!names[@]}"; do
+    state="$(diagnostic_container "${names[index]}")"
+    case "$state" in
+      'running / healthy') label=Healthy; color="$GREEN" ;;
+      'running / unhealthy'|dead) label=Unhealthy; color="$RED" ;;
+      'running / health starting') label=Starting; color="$YELLOW" ;;
+      restarting) label=Restarting; color="$YELLOW" ;;
+      running*) label=Running; color="$CYAN" ;;
+      exited|created) label=Stopped; color="$YELLOW" ;;
+      removing) label=Removing; color="$YELLOW" ;;
+      paused) label=Paused; color="$YELLOW" ;;
+      absent)
+        if [ -f "${configs[index]}" ]; then label='Not started'; color="$YELLOW"
+        else label='Not installed'; color="$GRAY"; fi ;;
+      *) label=Unknown; color="$GRAY" ;;
+    esac
+    if [ "$index" = 0 ] && [ -n "$address" ]; then
+      printf '  %-14s %b%-14s%b%s\n' "${labels[index]}" "$color" "$label" "$RESET" "$address"
+    else
+      printf '  %-14s %b%s%b\n' "${labels[index]}" "$color" "$label" "$RESET"
+    fi
+  done
+  if [ "$DIAG_DOCKER" != available ]; then
+    issues+=('Docker unavailable')
+  elif [ "$panel_state" != absent ] || [ -f "${configs[0]}" ]; then
+    for name in remnawave-db remnawave-redis; do
+      state="$(diagnostic_container "$name")"
+      case "$state" in 'running / healthy'|'running / health not reported') continue ;; esac
+      label=Database; [ "$name" != remnawave-redis ] || label=Redis
+      issues+=("$label needs attention")
+    done
+  fi
+  if [ "${#issues[@]}" -gt 0 ]; then
+    printf '  %b! %s' "$YELLOW" "${issues[0]}"
+    for ((index=1; index<${#issues[@]}; index++)); do printf '; %s' "${issues[index]}"; done
+    printf '  [9] Diagnose%b\n' "$RESET"
+  fi
+  printf '\n'
+)
+
+show_status_details() (
+  load_panel_state
   local domain name
   domain="$(diagnostic_domain "${PANEL_DOMAIN:-}")"
   diagnostic_snapshot
@@ -4004,7 +4057,7 @@ diagnose_installation() (
   domain="$(diagnostic_domain "${PANEL_DOMAIN:-}")"
   subscription="$(diagnostic_domain "${SUBSCRIPTION_DOMAIN:-}")"
   printf 'Read-only diagnostics (HTTP 000 = connection/TLS failure; unknown = unavailable probe)\n'
-  show_dashboard
+  show_status_details
   diagnostic_snapshot
   for name in remnawave remnawave-db remnawave-redis remnawave-subscription-page; do
     state="$(diagnostic_container "$name")"
@@ -4792,7 +4845,6 @@ run_menu_action() {
 show_main_menu() {
   menu_title "Remnawave installer ${SCRIPT_VERSION}"
   show_dashboard || note "Dashboard unavailable. System -> Diagnose installation can check the cause."
-  micro "At prompts: /back returns to the previous step, /cancel returns to the menu."
   menu_item 1 "Install"
   menu_item 2 "Panel"
   menu_item 3 "Node"
@@ -4804,6 +4856,7 @@ show_main_menu() {
   menu_item 9 "Diagnose installation"
   menu_item 0 "Exit"
   blank
+  micro "Input: /back = previous step; /cancel = menu"
 }
 
 show_install_menu() {
