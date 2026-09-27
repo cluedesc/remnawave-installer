@@ -114,6 +114,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/cluedesc/remnawave-installer/m
 
 ## Features
 
+### Input and Recovery
+
+Invalid passwords, domains, ports, and numbered selections are requested again. Admin password requirements are shown before entry: at least 24 characters, including uppercase letters, lowercase letters, and numbers. Failed authentication lets you retry or return to the menu.
+
+An operation failure or Ctrl+C during an operation returns to the menu and preserves completed steps. If Panel is already installed, finish admin creation through **Panel -> Create Panel admin** and subscription setup through **Panel -> Configure subscription page**. Repeating **Install Panel** leaves existing Panel files in place. A failed system operation can still require fixing the reported problem before retrying; the installer does not automatically undo partially completed operations.
+
 ### Installation
 
 - Panel installation
@@ -253,7 +259,7 @@ If you use it on a real server, include your distribution, version, virtualizati
 
 ## Regression Checks
 
-The tests require Bash, jq, OpenSSL, and standard Unix tools. They use temporary files and mock Docker/HTTP calls; they do not install services or contact a running Panel.
+Tests are optional for running the installer. For development, they require Bash, jq, OpenSSL, and standard Unix tools. They use temporary files and mock Docker/HTTP calls; they do not install services or contact a running Panel. They cover configuration, API calls, backups, readiness, input retries, authentication retries, and returning to the menu after an operation fails.
 
 ```bash
 bash -n remnawave_installer.sh

@@ -151,11 +151,13 @@ menu_item_accent() {
 
 read_input() {
   local __read_input_value=""
+  local __read_input_fd
 
-  if [ -r /dev/tty ] && IFS= read -r __read_input_value 2>/dev/null </dev/tty; then
-    :
+  if { exec {__read_input_fd}</dev/tty; } 2>/dev/null; then
+    IFS= read -r __read_input_value <&"$__read_input_fd" || { exec {__read_input_fd}<&-; return 130; }
+    exec {__read_input_fd}<&-
   else
-    IFS= read -r __read_input_value || true
+    IFS= read -r __read_input_value || return 130
   fi
 
   printf '%s' "$__read_input_value"
@@ -163,11 +165,13 @@ read_input() {
 
 read_secret_input() {
   local __read_secret_input_value=""
+  local __read_secret_input_fd
 
-  if [ -r /dev/tty ] && IFS= read -r -s __read_secret_input_value 2>/dev/null </dev/tty; then
-    :
+  if { exec {__read_secret_input_fd}</dev/tty; } 2>/dev/null; then
+    IFS= read -r -s __read_secret_input_value <&"$__read_secret_input_fd" || { exec {__read_secret_input_fd}<&-; return 130; }
+    exec {__read_secret_input_fd}<&-
   else
-    IFS= read -r -s __read_secret_input_value || true
+    IFS= read -r -s __read_secret_input_value || return 130
   fi
 
   printf '%s' "$__read_secret_input_value"
@@ -196,13 +200,11 @@ run_cmd() {
   log_file_append ""
   log_file_append "[$(date '+%Y-%m-%d %H:%M:%S')] RUN: $*"
 
-  set +e
-
-  "$@" >"$output_file" 2>&1
-
-  exit_code=$?
-
-  set -e
+  if "$@" >"$output_file" 2>&1; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
 
   if [ "$exit_code" -eq 0 ]; then
     log_file_block "OUTPUT: $description" "$output_file"
@@ -240,6 +242,8 @@ run_cmd_stream() {
 
   local output_file
   local exit_code
+  local -a pipeline_status
+  local pipeline_code
 
   case "${cmd[0]}" in
     apt|apt-get)
@@ -265,27 +269,35 @@ run_cmd_stream() {
   log_file_append ""
   log_file_append "[$(date '+%Y-%m-%d %H:%M:%S')] RUN: ${cmd[*]}"
 
-  set +e
-
   if [ -d "$LOG_DIR" ] && [ -w "$LOG_DIR" ]; then
     printf "%b\n" "${GRAY}    |-- output${RESET}"
 
-    "${cmd[@]}" 2>&1 | tr '\r' '\n' | sed '/^[[:space:]]*$/d' | tee "$output_file" | tee -a "$LOG_FILE" | sed 's/^/    | /'
-
-    exit_code=${PIPESTATUS[0]}
+    if "${cmd[@]}" 2>&1 | tr '\r' '\n' | sed '/^[[:space:]]*$/d' | tee "$output_file" | tee -a "$LOG_FILE" | sed 's/^/    | /'; then
+      pipeline_status=("${PIPESTATUS[@]}")
+    else
+      pipeline_status=("${PIPESTATUS[@]}")
+    fi
 
     printf "%b\n" "${GRAY}    |-- end${RESET}"
   else
     printf "%b\n" "${GRAY}    |-- output${RESET}"
 
-    "${cmd[@]}" 2>&1 | tr '\r' '\n' | sed '/^[[:space:]]*$/d' | tee "$output_file" | sed 's/^/    | /'
-
-    exit_code=${PIPESTATUS[0]}
+    if "${cmd[@]}" 2>&1 | tr '\r' '\n' | sed '/^[[:space:]]*$/d' | tee "$output_file" | sed 's/^/    | /'; then
+      pipeline_status=("${PIPESTATUS[@]}")
+    else
+      pipeline_status=("${PIPESTATUS[@]}")
+    fi
 
     printf "%b\n" "${GRAY}    |-- end${RESET}"
   fi
 
-  set -e
+  exit_code=0
+  for pipeline_code in "${pipeline_status[@]}"; do
+    if [ "$pipeline_code" -ne 0 ]; then
+      exit_code="$pipeline_code"
+      break
+    fi
+  done
 
   if [ "$exit_code" -eq 0 ]; then
     rm -f "$output_file"
@@ -331,42 +343,42 @@ prepare_log() {
 }
 
 ask() {
-  local prompt="$1"
-  local var_name="$2"
-  local default_value="${3:-}"
+  local __ask_prompt="$1"
+  local __ask_var_name="$2"
+  local __ask_default_value="${3:-}"
 
   local __ask_value=""
 
-  if [ -n "$default_value" ]; then
-    prompt_line "$prompt "
-    prompt_default "[$default_value]"
+  if [ -n "$__ask_default_value" ]; then
+    prompt_line "$__ask_prompt "
+    prompt_default "[$__ask_default_value]"
 
     printf ": "
 
-    __ask_value="$(read_input)"
+    __ask_value="$(read_input)" || return 130
 
-    __ask_value="${__ask_value:-$default_value}"
+    __ask_value="${__ask_value:-$__ask_default_value}"
   else
-    prompt_line "$prompt: "
+    prompt_line "$__ask_prompt: "
 
-    __ask_value="$(read_input)"
+    __ask_value="$(read_input)" || return 130
   fi
 
   __ask_value="$(printf "%s" "$__ask_value" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
 
-  printf -v "$var_name" '%s' "$__ask_value"
+  printf -v "$__ask_var_name" '%s' "$__ask_value"
 }
 
 ask_secret() {
-  local prompt="$1"
-  local var_name="$2"
-  local show_empty_note="${3:-1}"
+  local __ask_secret_prompt="$1"
+  local __ask_secret_var_name="$2"
+  local __ask_secret_show_empty_note="${3:-1}"
 
   local __ask_secret_value=""
 
-  prompt_line "$prompt: "
+  prompt_line "$__ask_secret_prompt: "
 
-  __ask_secret_value="$(read_secret_input)"
+  __ask_secret_value="$(read_secret_input)" || { printf "\n"; return 130; }
 
   printf "\n"
 
@@ -374,50 +386,79 @@ ask_secret() {
 
   if [ -n "$__ask_secret_value" ]; then
     micro "input hidden"
-  elif [ "$show_empty_note" = "1" ]; then
+  elif [ "$__ask_secret_show_empty_note" = "1" ]; then
     note "Secret value is empty."
   fi
 
-  printf -v "$var_name" '%s' "$__ask_secret_value"
+  printf -v "$__ask_secret_var_name" '%s' "$__ask_secret_value"
 }
 
 ask_required() {
-  local prompt="$1"
-  local var_name="$2"
+  local __ask_required_prompt="$1"
+  local __ask_required_var_name="$2"
   local __ask_required_value=""
 
   while true; do
     if [ "$#" -ge 3 ]; then
-      ask "$prompt" __ask_required_value "$3"
+      ask "$__ask_required_prompt" __ask_required_value "$3" || return 130
     else
-      ask "$prompt" __ask_required_value
+      ask "$__ask_required_prompt" __ask_required_value || return 130
     fi
 
     if [ -n "$__ask_required_value" ]; then
-      printf -v "$var_name" '%s' "$__ask_required_value"
+      printf -v "$__ask_required_var_name" '%s' "$__ask_required_value"
 
       return 0
     fi
 
-    warn "${prompt} cannot be empty. Please try again."
+    warn "${__ask_required_prompt} cannot be empty. Please try again."
   done
 }
 
 ask_secret_required() {
-  local prompt="$1"
-  local var_name="$2"
+  local __ask_secret_required_prompt="$1"
+  local __ask_secret_required_var_name="$2"
   local __ask_secret_required_value=""
 
   while true; do
-    ask_secret "$prompt" __ask_secret_required_value 0
+    ask_secret "$__ask_secret_required_prompt" __ask_secret_required_value 0 || return 130
 
     if [ -n "$__ask_secret_required_value" ]; then
-      printf -v "$var_name" '%s' "$__ask_secret_required_value"
+      printf -v "$__ask_secret_required_var_name" '%s' "$__ask_secret_required_value"
 
       return 0
     fi
 
-    warn "${prompt} cannot be empty. Please try again."
+    warn "${__ask_secret_required_prompt} cannot be empty. Please try again."
+  done
+}
+
+ask_validated() {
+  local __ask_validated_value=""
+  while true; do
+    ask "$1" __ask_validated_value "${5:-}" || return 130
+    if "$3" "$__ask_validated_value"; then
+      printf -v "$2" '%s' "$__ask_validated_value"
+      return 0
+    fi
+    warn "$4 Please try again."
+  done
+}
+
+ask_choice() {
+  local __ask_choice_value=""
+  while true; do
+    ask "$1" __ask_choice_value "${5:-}" || return 130
+    if [[ "$__ask_choice_value" =~ ^[0-9]+$ ]]; then
+      # Strip zeroes before arithmetic so input is decimal and cannot overflow.
+      while [[ "$__ask_choice_value" == 0?* ]]; do __ask_choice_value="${__ask_choice_value#0}"; done
+      if [ "${#__ask_choice_value}" -le 9 ] &&
+         [ "$__ask_choice_value" -ge "$3" ] && [ "$__ask_choice_value" -le "$4" ]; then
+        printf -v "$2" '%s' "$__ask_choice_value"
+        return 0
+      fi
+    fi
+    warn "Enter a number from $3 to $4."
   done
 }
 
@@ -431,11 +472,7 @@ confirm() {
 
   printf ": "
 
-  if [ -r /dev/tty ] && IFS= read -r answer 2>/dev/null </dev/tty; then
-    :
-  else
-    IFS= read -r answer || true
-  fi
+  answer="$(read_input)" || return 130
 
   normalized="$(printf "%s" "$answer" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
 
@@ -448,27 +485,27 @@ confirm() {
 }
 
 ask_menu_choice() {
-  local var_name="$1"
+  local __ask_menu_choice_var_name="$1"
   
   local __ask_menu_choice_value=""
 
   prompt_line "Selection: "
-  __ask_menu_choice_value="$(read_input)"
+  __ask_menu_choice_value="$(read_input)" || return 130
   __ask_menu_choice_value="$(printf "%s" "$__ask_menu_choice_value" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
 
-  printf -v "$var_name" '%s' "$__ask_menu_choice_value"
+  printf -v "$__ask_menu_choice_var_name" '%s' "$__ask_menu_choice_value"
 }
 
 ask_delete_confirmation() {
-  local var_name="$1"
+  local __ask_delete_confirmation_var_name="$1"
 
   local __ask_delete_confirmation_value=""
 
   prompt_line "Type DELETE to confirm: "
-  __ask_delete_confirmation_value="$(read_input)"
+  __ask_delete_confirmation_value="$(read_input)" || return 130
   __ask_delete_confirmation_value="$(printf "%s" "$__ask_delete_confirmation_value" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
 
-  printf -v "$var_name" '%s' "$__ask_delete_confirmation_value"
+  printf -v "$__ask_delete_confirmation_var_name" '%s' "$__ask_delete_confirmation_value"
 }
 
 command_exists() {
@@ -572,6 +609,7 @@ validate_domain() {
   [[ "$domain" != *"/"* ]] || return 1
   [[ "$domain" != .* && "$domain" != *. ]] || return 1
   [[ "$domain" == *.* ]] || return 1
+  [[ ! "$domain" =~ ^[0-9.]+$ ]] || return 1
 
   IFS=. read -ra labels <<< "$domain"
 
@@ -586,7 +624,13 @@ validate_port() {
   local port="$1"
 
   [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  while [[ "$port" == 0?* ]]; do port="${port#0}"; done
+  [ "${#port}" -le 5 ] || return 1
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+validate_optional_ipv4() {
+  [ -z "$1" ] || is_ipv4 "$1"
 }
 
 validate_host() {
@@ -759,7 +803,7 @@ check_domain_dns() {
   if [ -z "$domain_ips" ]; then
     warn "Warning: DNS A record was not found for ${domain}."
 
-    confirm "Continue without a successful DNS check?" || die "Cancelled."
+    confirm "Continue without a successful DNS check?" || return 130
 
     return 0
   fi
@@ -776,7 +820,7 @@ check_domain_dns() {
     if is_cloudflare_ipv4 "$ip"; then
       warn "DNS ${domain} resolves to Cloudflare IP ${ip}."
 
-      confirm "Continue with Cloudflare proxy enabled?" || die "Cancelled."
+      confirm "Continue with Cloudflare proxy enabled?" || return 130
 
       return 0
     fi
@@ -786,7 +830,7 @@ check_domain_dns() {
 
   warn "Public server IPv4: ${server_ip}"
 
-  confirm "Continue? TLS issuance may fail." || die "Cancelled."
+  confirm "Continue? TLS issuance may fail." || return 130
 }
 
 # DNS END
@@ -918,8 +962,11 @@ backup_validate_files() {
 
 restore_backup() (
   local archive stage name has_panel
-  ask_required "Backup .tar.gz path" archive
-  [ -f "$archive" ] || { warn "Backup was not found: ${archive}"; return 1; }
+  while true; do
+    ask_required "Backup .tar.gz path" archive || return $?
+    [ ! -f "$archive" ] || break
+    warn "Backup was not found: ${archive}. Enter an existing archive path."
+  done
   umask 077
   stage="$(mktemp -d)" || return 1
   trap 'rm -rf -- "$stage"' EXIT
@@ -1066,6 +1113,11 @@ default_panel_api_base() {
   if [ -n "${PANEL_AUTH_BASE:-}" ]; then
     printf "%s" "$PANEL_AUTH_BASE"
 
+    return 0
+  fi
+
+  if [ "${WEBSERVER:-}" = "none" ]; then
+    printf 'http://127.0.0.1:3000'
     return 0
   fi
 
@@ -1869,9 +1921,7 @@ issue_cloudflare_wildcard_cert() {
 
   local cred_file="/root/.secrets/certbot/cloudflare.ini"
 
-  ask_required "Base domain, for example example.com" base_domain
-
-  validate_domain "$base_domain" || die "Invalid base domain: ${base_domain}"
+  ask_validated "Base domain, for example example.com" base_domain validate_domain "Enter a domain such as example.com, without a URL or path."
 
   ask_required "Email Let's Encrypt" email
 
@@ -1908,9 +1958,7 @@ issue_gcore_wildcard_cert() {
 
   local cred_file="/root/.secrets/certbot/gcore.ini"
 
-  ask_required "Base domain, for example example.com" base_domain
-
-  validate_domain "$base_domain" || die "Invalid base domain: ${base_domain}"
+  ask_validated "Base domain, for example example.com" base_domain validate_domain "Enter a domain such as example.com, without a URL or path."
 
   ask_required "Email Let's Encrypt" email
 
@@ -2251,90 +2299,79 @@ start_panel_stack() {
 
 create_panel_admin() {
   local panel_base="${1:-}"
-  local mode
-  local username
-  local password
-  local response
-  local access_token
-  local response_file
-  local http_code
+  local mode username="" password response access_token response_file http_code register_allowed
+  PANEL_ADMIN_USERNAME=""
+  PANEL_ADMIN_PASSWORD=""
 
   if [ -z "$panel_base" ]; then
     panel_base="$(default_panel_api_base)"
   fi
 
-  if ! curl -fsS "${panel_base%/}/api/auth/status" >/dev/null 2>&1; then
-    warn "Panel API at ${panel_base} did not respond in time. Admin creation skipped."
-
+  if ! response=$(curl -fsS -H "X-Forwarded-Proto: https" -H "X-Forwarded-For: 127.0.0.1" "${panel_base%/}/api/auth/status"); then
+    warn "Panel API at ${panel_base} did not respond. Retry admin creation from the Panel menu."
     return 1
   fi
-
-  menu_title "Panel admin creation"
-  menu_item 1 "Enter username/password manually"
-  menu_item 2 "Generate automatically"
-  menu_item 0 "Skip"
-
-  blank
-
-  ask "Selection" mode "1"
-
-  case "$mode" in
-    1)
-      ask_required "Admin username" username
-      ask_secret_required "Admin password" password
-      ;;
-    2)
-      username="$(random_username)"
-      password="$(random_password)"
-      ;;
-    0)
-      warn "Panel admin creation skipped by user."
-
-      return 1
-      ;;
-    *)
-      warn "Invalid selection. Admin creation skipped."
-      
-      return 1
-      ;;
+  register_allowed=$(printf '%s\n' "$response" | jq -r '.response.isRegisterAllowed | if type == "boolean" then tostring else empty end' 2>/dev/null) || register_allowed=""
+  case "$register_allowed" in
+    false) ok "Panel admin is already registered; registration is disabled."; return 0 ;;
+    true) ;;
+    *) warn "Panel returned an invalid authentication status. Retry admin creation later."; return 1 ;;
   esac
 
-  validate_admin_password "$password" || die "Admin password must be at least 24 characters long and contain uppercase letters, lowercase letters, and numbers."
+  while true; do
+    menu_title "Panel admin creation"
+    menu_item 1 "Enter username/password manually"
+    menu_item 2 "Generate automatically"
+    menu_item 0 "Skip"
+    blank
+    ask_choice "Selection" mode 0 2 "1" || return 130
 
-  response_file="$(mktemp)"
+    case "$mode" in
+      1)
+        ask_required "Admin username" username "$username" || return 130
+        info "Admin password requires at least 24 characters, including uppercase and lowercase letters and numbers."
+        while true; do
+          ask_secret_required "Admin password" password || return 130
+          if validate_admin_password "$password"; then break; fi
+          warn "Password must be at least 24 characters and include uppercase and lowercase letters and numbers. Please try again."
+        done
+        ;;
+      2)
+        username="$(random_username)"
+        password="$(random_password)"
+        ;;
+      0)
+        warn "Panel admin creation skipped. You can finish it later from the Panel menu."
+        return 0
+        ;;
+    esac
 
-  http_code=$(curl -sS -o "$response_file" -w "%{http_code}" -X POST "${panel_base%/}/api/auth/register" \
-    -H "Content-Type: application/json" \
-    -H "X-Forwarded-Proto: https" \
-    -H "X-Remnawave-Client-Type: browser" \
-    --data "$(jq -n --arg username "$username" --arg password "$password" '{username:$username,password:$password}')") || true
+    response_file="$(mktemp)" || return 1
+    http_code=$(curl -sS -o "$response_file" -w "%{http_code}" -X POST "${panel_base%/}/api/auth/register" \
+      -H "Content-Type: application/json" \
+      -H "X-Forwarded-Proto: https" \
+      -H "X-Forwarded-For: 127.0.0.1" \
+      -H "X-Remnawave-Client-Type: browser" \
+      --data "$(jq -n --arg username "$username" --arg password "$password" '{username:$username,password:$password}')") || http_code="000"
+    response="$(cat "$response_file")"
+    rm -f "$response_file"
 
-  response="$(cat "$response_file")"
+    if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      warn "Panel admin registration failed (HTTP ${http_code}). Check your input and retry, or skip and finish later."
+      continue
+    fi
+    access_token=$(printf '%s\n' "$response" | jq -r '.response.accessToken // empty' 2>/dev/null) || access_token=""
+    if [ -z "$access_token" ]; then
+      warn "Panel registration did not return an access token. Check the Panel before retrying admin creation."
+      return 1
+    fi
 
-  rm -f "$response_file"
-
-  if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-    warn "Panel /api/auth/register returned HTTP ${http_code}: ${response}"
-
-    return 1
-  fi
-
-  access_token=$(printf "%s\n" "$response" | jq -r '.response.accessToken // empty')
-
-  if [ -z "$access_token" ]; then
-    warn "Panel did not return accessToken during admin registration: $response"
-
-    return 1
-  fi
-
-  PANEL_ADMIN_USERNAME="$username"
-  PANEL_ADMIN_PASSWORD="$password"
-
-  remember_panel_auth "$panel_base" "$access_token" "$username" "$password"
-
-  ok "Panel admin created."
-
-  return 0
+    PANEL_ADMIN_USERNAME="$username"
+    PANEL_ADMIN_PASSWORD="$password"
+    remember_panel_auth "$panel_base" "$access_token" "$username" "$password"
+    ok "Panel admin created."
+    return 0
+  done
 }
 
 print_panel_summary() {
@@ -2367,6 +2404,44 @@ print_panel_summary() {
   blank
 }
 
+prepare_new_panel_files() (
+  local panel_domain="$1" subscription_domain="$2"
+  local stage published=0 file
+  umask 077
+  mkdir -p "$PANEL_DIR" || return 1
+  for file in .env docker-compose.yml; do
+    if [ -e "$PANEL_DIR/$file" ] || [ -L "$PANEL_DIR/$file" ]; then
+      warn "Existing Panel configuration will not be overwritten: ${PANEL_DIR}/${file}"
+      return 1
+    fi
+  done
+  stage="$(mktemp -d "$PANEL_DIR/.install.XXXXXX")" || return 1
+  cleanup_panel_files() {
+    local status="$?" file
+    if [ "$published" = 0 ]; then
+      for file in .env docker-compose.yml; do
+        if [ "$PANEL_DIR/$file" -ef "$stage/$file" ]; then
+          rm -f -- "$PANEL_DIR/$file" || status=1
+        fi
+      done
+    fi
+    rm -rf -- "$stage" || status=1
+    exit "$status"
+  }
+  trap cleanup_panel_files EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  run_cmd "Download Remnawave docker-compose.yml" curl -fsSL "$PANEL_COMPOSE_URL" -o "$stage/docker-compose.yml" || return 1
+  run_cmd "Download Remnawave .env.sample" curl -fsSL "$PANEL_ENV_URL" -o "$stage/.env" || return 1
+  chmod 600 "$stage/.env" || return 1
+  configure_panel_env "$stage/.env" "$panel_domain" "$subscription_domain" || return 1
+  PANEL_DIR="$stage" validate_panel_v3 || return 1
+  # Hard links publish without replacing files created by another installation.
+  ln -T -- "$stage/.env" "$PANEL_DIR/.env" || return 1
+  ln -T -- "$stage/docker-compose.yml" "$PANEL_DIR/docker-compose.yml" || return 1
+  published=1
+)
+
 install_panel() {
   local panel_domain
   local subscription_domain
@@ -2377,22 +2452,31 @@ install_panel() {
 
   section "Install Remnawave Panel"
 
-  install_prerequisites
-
-  if [ -d "$PANEL_DIR" ] && [ -f "$PANEL_DIR/docker-compose.yml" ]; then
-    die "${PANEL_DIR} already exists. Use update or remove."
+  if [ -e "$PANEL_DIR/.env" ] || [ -L "$PANEL_DIR/.env" ] ||
+    [ -e "$PANEL_DIR/docker-compose.yml" ] || [ -L "$PANEL_DIR/docker-compose.yml" ]; then
+    if [ ! -f "$PANEL_DIR/.env" ] || [ ! -f "$PANEL_DIR/docker-compose.yml" ]; then
+      warn "Panel configuration is incomplete in ${PANEL_DIR}. Existing files and secrets were preserved."
+      note "Restore the missing .env or docker-compose.yml from your backup, then use Panel -> Start."
+      note "Newly generated credentials cannot replace the original credentials of an existing database."
+      return 1
+    fi
+    validate_panel_v3 || { warn "Existing Panel configuration needs repair; files and secrets were preserved."; return 1; }
+    note "Panel files already exist in ${PANEL_DIR}."
+    note "Use Panel -> Start, Create Panel admin, or Configure subscription page to finish setup."
+    return 0
   fi
 
-  ask_required "Panel domain, for example panel.example.com" panel_domain
-
-  validate_domain "$panel_domain" || die "Invalid panel domain: ${panel_domain}"
+  ask_validated "Panel domain, for example panel.example.com" panel_domain validate_domain "Enter a valid domain without https:// or a path." || return $?
 
   subscription_domain_default="$(default_subscription_domain "$panel_domain")"
 
-  ask_required "Subscription page domain, for example sub.example.com" subscription_domain "$subscription_domain_default"
+  while true; do
+    ask_validated "Subscription page domain, for example sub.example.com" subscription_domain validate_domain "Enter a valid domain without https:// or a path." "$subscription_domain_default" || return $?
+    [ "$subscription_domain" = "$panel_domain" ] || break
+    warn "Subscription page domain must be different from Panel domain. Try again."
+  done
 
-  validate_domain "$subscription_domain" || die "Invalid subscription page domain: ${subscription_domain}"
-  [ "$subscription_domain" != "$panel_domain" ] || die "Subscription page domain must be different from Panel domain."
+  install_prerequisites
 
   section "DNS check"
 
@@ -2408,35 +2492,24 @@ install_panel() {
 
   blank
 
-  ask "Selection" webserver_choice "1"
+  ask_choice "Selection" webserver_choice 1 3 "1" || return $?
 
   case "$webserver_choice" in
     1) webserver="caddy" ;;
     2) webserver="nginx" ;;
     3) webserver="none" ;;
-    *) die "Invalid reverse proxy selection." ;;
   esac
 
-  mkdir -p "$PANEL_DIR"
-
-  cd "$PANEL_DIR"
-
   section "Panel files"
-
-  run_cmd "Download Remnawave docker-compose.yml" curl -fsSL "$PANEL_COMPOSE_URL" -o docker-compose.yml
-  run_cmd "Download Remnawave .env.sample" curl -fsSL "$PANEL_ENV_URL" -o .env
-
-  chmod 600 .env
-
-  configure_panel_env .env "$panel_domain" "$subscription_domain" || die "Failed to configure the Panel environment."
-  validate_panel_v3 || die "Panel configuration is invalid."
+  prepare_new_panel_files "$panel_domain" "$subscription_domain" || return $?
+  cd "$PANEL_DIR" || return 1
 
   note "If reverse proxy configuration fails, containers will remain stopped or partially started in ${PANEL_DIR}."
 
   section "Reverse proxy"
 
-  configure_panel_reverse_proxy "$panel_domain" "$webserver" "$letsencrypt_email"
   save_panel_state "$panel_domain" "$webserver" "$letsencrypt_email" "$subscription_domain"
+  configure_panel_reverse_proxy "$panel_domain" "$webserver" "$letsencrypt_email"
 
   section "Panel startup"
 
@@ -2462,7 +2535,12 @@ install_panel() {
   if confirm "Create Panel admin now?"; then
     section "Panel admin"
 
-    create_panel_admin "https://${panel_domain}" || die "Panel admin was not created. Fix the error above before configuring dependent services."
+    local admin_base="https://${panel_domain}"
+    [ "$webserver" != "none" ] || admin_base="http://127.0.0.1:3000"
+    if ! create_panel_admin "$admin_base"; then
+      note "Panel is installed. Retry admin creation from Panel -> Create Panel admin."
+      return 0
+    fi
   else
     skip "Panel admin creation skipped by user."
   fi
@@ -2475,6 +2553,16 @@ install_panel() {
     setup_subscription_page_for_panel "$subscription_domain"
   else
     skip "remnawave-subscription-page configuration skipped by user."
+  fi
+}
+
+create_admin_for_existing_panel() {
+  [ -f "$PANEL_DIR/docker-compose.yml" ] || die "Panel is not installed."
+  PANEL_ADMIN_USERNAME=""
+  PANEL_ADMIN_PASSWORD=""
+  create_panel_admin
+  if [ -n "$PANEL_ADMIN_USERNAME" ] && [ -n "$PANEL_ADMIN_PASSWORD" ]; then
+    printf 'Admin username: %s\nAdmin password: %s\n' "$PANEL_ADMIN_USERNAME" "$PANEL_ADMIN_PASSWORD"
   fi
 }
 
@@ -2517,9 +2605,8 @@ reinstall_panel_keep_config() {
 remove_panel() {
   load_panel_state
 
+  remove_stack "Panel" "$PANEL_DIR" || return $?
   remove_panel_reverse_proxy
-
-  remove_stack "Panel" "$PANEL_DIR"
 
   rm -f "$PANEL_STATE_FILE"
 }
@@ -2527,9 +2614,8 @@ remove_panel() {
 remove_panel_with_volumes() {
   load_panel_state
 
+  remove_stack_with_volumes "Panel" "$PANEL_DIR" || return $?
   remove_panel_reverse_proxy
-
-  remove_stack_with_volumes "Panel" "$PANEL_DIR"
 
   rm -f "$PANEL_STATE_FILE"
 }
@@ -2615,125 +2701,102 @@ panel_api_token_is_valid() {
 }
 
 login_panel_and_get_token() {
-  local panel_base="$1"
-  local username="$2"
-  local password="$3"
-  local token_var="$4"
+  local panel_base="$1" username="$2" password="$3" token_var="$4"
+  local response response_file http_code login_access_token
 
-  local response
-  local response_file
-  local http_code
-  local login_access_token
-
-  response_file="$(mktemp)"
-
+  printf -v "$token_var" '%s' ''
+  response_file="$(mktemp)" || return 1
   http_code=$(curl -sS -o "$response_file" -w "%{http_code}" -X POST "${panel_base%/}/api/auth/login" \
     -H "Content-Type: application/json" \
     -H "X-Forwarded-Proto: https" \
+    -H "X-Forwarded-For: 127.0.0.1" \
     -H "X-Remnawave-Client-Type: browser" \
-    --data "$(jq -n --arg username "$username" --arg password "$password" '{username:$username,password:$password}')") || true
-
+    --data "$(jq -n --arg username "$username" --arg password "$password" '{username:$username,password:$password}')") || http_code="000"
   response="$(cat "$response_file")"
-
   rm -f "$response_file"
 
-  if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-    die "Panel /api/auth/login returned HTTP ${http_code}: ${response}"
+  if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    warn "Panel login failed (HTTP ${http_code}). Check the username/password and Panel availability."
+    return 1
   fi
-
-  login_access_token=$(printf "%s\n" "$response" | jq -r '.response.accessToken // empty')
-
-  [ -n "$login_access_token" ] || die "Panel login succeeded, but accessToken was not returned."
-
+  login_access_token=$(printf '%s\n' "$response" | jq -r '.response.accessToken // empty' 2>/dev/null) || login_access_token=""
+  if [ -z "$login_access_token" ]; then
+    warn "Panel login did not return an access token."
+    return 1
+  fi
   printf -v "$token_var" '%s' "$login_access_token"
 }
 
 get_panel_api_token() {
-  local panel_base="$1"
-  local token_var="$2"
-
-  local api_token
-  local username
-  local password
-  local auth_choice
-
+  local panel_base="$1" token_var="$2"
+  local api_token="" username="" password="" auth_choice answer_status
   local default_username=""
 
   load_panel_auth_state
-
   if [ -n "${PANEL_AUTH_TOKEN:-}" ]; then
-    if confirm "Use previously saved Panel API/access token for ${panel_base}?"; then
+    answer_status=0
+    confirm "Use previously saved Panel API/access token for ${panel_base}?" || answer_status=$?
+    [ "$answer_status" -ne 130 ] || return 130
+    if [ "$answer_status" -eq 0 ]; then
       if panel_api_token_is_valid "$panel_base" "$PANEL_AUTH_TOKEN"; then
         ok "Using previously saved Panel API/access token."
-
         printf -v "$token_var" '%s' "$PANEL_AUTH_TOKEN"
-
         return 0
       fi
-
       warn "Saved Panel API/access token is no longer valid."
-
       clear_panel_auth_token
     fi
   fi
 
   if [ -n "${PANEL_AUTH_USERNAME:-}" ] && [ -n "${PANEL_AUTH_PASSWORD:-}" ]; then
-    if confirm "Use previously saved Panel login/password for ${panel_base}?"; then
-      login_panel_and_get_token "$panel_base" "$PANEL_AUTH_USERNAME" "$PANEL_AUTH_PASSWORD" api_token
-
-      remember_panel_auth "$panel_base" "$api_token" "$PANEL_AUTH_USERNAME" "$PANEL_AUTH_PASSWORD"
-
-      ok "Using previously saved Panel login/password."
-
-      printf -v "$token_var" '%s' "$api_token"
-
-      return 0
+    answer_status=0
+    confirm "Use previously saved Panel login/password for ${panel_base}?" || answer_status=$?
+    [ "$answer_status" -ne 130 ] || return 130
+    if [ "$answer_status" -eq 0 ]; then
+      if login_panel_and_get_token "$panel_base" "$PANEL_AUTH_USERNAME" "$PANEL_AUTH_PASSWORD" api_token; then
+        if panel_api_token_is_valid "$panel_base" "$api_token"; then
+          remember_panel_auth "$panel_base" "$api_token" "$PANEL_AUTH_USERNAME" "$PANEL_AUTH_PASSWORD"
+          ok "Using previously saved Panel login/password."
+          printf -v "$token_var" '%s' "$api_token"
+          return 0
+        fi
+      fi
+      warn "Saved Panel credentials could not be used. Choose another authentication method."
     fi
   fi
 
-  menu_title "Panel API auth"
-  menu_item 1 "Paste existing API/access token"
-  menu_item 2 "Panel login/password"
-
-  blank
-
-  ask "Selection" auth_choice "1"
-
-  case "$auth_choice" in
-    1)
-      ask_secret_required "Panel API/access token" api_token
-      ;;
-    2)
-      default_username="${PANEL_AUTH_USERNAME:-${PANEL_ADMIN_USERNAME:-}}"
-
-      if [ -n "$default_username" ]; then
-        ask_required "Panel username" username "$default_username"
-      else
-        ask_required "Panel username" username
-      fi
-
-      ask_secret_required "Panel password" password
-
-      login_panel_and_get_token "$panel_base" "$username" "$password" api_token
-      ;;
-    *)
-      die "Invalid authentication method."
-      ;;
-  esac
-
-  [ -n "$api_token" ] || die "Failed to obtain token."
-
-  if ! panel_api_token_is_valid "$panel_base" "$api_token"; then
-    die "Token validation failed via /api/config-profiles."
-  fi
-
-  if [ "$auth_choice" = "1" ]; then
-    remember_panel_auth "$panel_base" "$api_token"
-  else
-    remember_panel_auth "$panel_base" "$api_token" "$username" "$password"
-  fi
-
-  printf -v "$token_var" '%s' "$api_token"
+  default_username="${PANEL_AUTH_USERNAME:-${PANEL_ADMIN_USERNAME:-}}"
+  while true; do
+    menu_title "Panel API auth"
+    menu_item 1 "Paste existing API/access token"
+    menu_item 2 "Panel login/password"
+    menu_item 0 "Cancel / back"
+    blank
+    ask_choice "Selection" auth_choice 0 2 "1" || return 130
+    case "$auth_choice" in
+      0) return 130 ;;
+      1)
+        ask_secret_required "Panel API/access token" api_token || return 130
+        ;;
+      2)
+        ask_required "Panel username" username "$default_username" || return 130
+        default_username="$username"
+        ask_secret_required "Panel password" password || return 130
+        if ! login_panel_and_get_token "$panel_base" "$username" "$password" api_token; then continue; fi
+        ;;
+    esac
+    if ! panel_api_token_is_valid "$panel_base" "$api_token"; then
+      warn "Token validation failed via /api/config-profiles. Check your credentials and Panel availability, then retry or cancel."
+      continue
+    fi
+    if [ "$auth_choice" = "1" ]; then
+      remember_panel_auth "$panel_base" "$api_token"
+    else
+      remember_panel_auth "$panel_base" "$api_token" "$username" "$password"
+    fi
+    printf -v "$token_var" '%s' "$api_token"
+    return 0
+  done
 }
 
 create_remnawave_node_api() {
@@ -2934,12 +2997,15 @@ setup_subscription_page_for_panel() {
   if [ -n "$provided_subscription_domain" ]; then
     subscription_domain="$provided_subscription_domain"
   else
-    ask_required "Subscription page domain, for example sub.example.com" subscription_domain "$subscription_domain_default"
+    subscription_domain=""
   fi
 
-  validate_domain "$subscription_domain" || die "Invalid subscription page domain: ${subscription_domain}"
-
-  [ "$subscription_domain" != "$panel_domain" ] || die "Subscription page domain must be different from Panel domain."
+  while ! validate_domain "$subscription_domain" || [ "$subscription_domain" = "$panel_domain" ]; do
+    if [ "$subscription_domain" = "$panel_domain" ] && [ -n "$subscription_domain" ]; then
+      warn "Subscription page domain must be different from Panel domain. Try again."
+    fi
+    ask_validated "Subscription page domain, for example sub.example.com" subscription_domain validate_domain "Enter a valid domain without https:// or a path." "$subscription_domain_default" || return $?
+  done
 
   webserver="${WEBSERVER:-}"
   letsencrypt_email="${LETSENCRYPT_EMAIL:-}"
@@ -2952,14 +3018,12 @@ setup_subscription_page_for_panel() {
 
     blank
 
-    ask "Selection" webserver "1"
+    ask_choice "Selection" webserver 1 3 "1" || return $?
 
     case "$webserver" in
       1) webserver="caddy" ;;
       2) webserver="nginx" ;;
       3) webserver="none" ;;
-      caddy|nginx|none) ;;
-      *) die "Invalid reverse proxy selection." ;;
     esac
   fi
 
@@ -3045,9 +3109,8 @@ install_node() {
     die "${NODE_DIR} already exists. Use update or remove."
   fi
 
-  ask "Node API port" node_port "2222"
-
-  validate_port "$node_port" || die "Invalid Node API port: ${node_port}"
+  ask_validated "Node API port" node_port validate_port "Enter a port from 1 to 65535." "2222"
+  while [[ "$node_port" == 0?* ]]; do node_port="${node_port#0}"; done
 
   if confirm "Create and add this Node in Panel automatically?"; then
     default_panel_base="$(default_panel_api_base)"
@@ -3064,7 +3127,7 @@ install_node() {
       node_address="$remnawave_gateway"
       detail "Using local Docker gateway as Node address for Panel: ${node_address}"
     else
-      ask_required "Node public address/IP" node_address "$(get_public_ipv4)"
+      ask_validated "Node public address/IP" node_address validate_host "Enter a valid IPv4 address or domain, without a URL or path." "$(get_public_ipv4)"
     fi
 
     validate_host "$node_address" || die "Invalid Node address: ${node_address}"
@@ -3089,11 +3152,7 @@ install_node() {
     panel_ip=""
     detail "Panel and Node are on one server. Firewall will allow the local Remnawave Docker network automatically."
   else
-    ask "Public panel IP for firewall" panel_ip "$(get_public_ipv4)"
-
-    if [ -n "$panel_ip" ] && ! is_ipv4 "$panel_ip"; then
-      die "Invalid public panel IP: ${panel_ip}"
-    fi
+    ask_validated "Public panel IP for firewall" panel_ip validate_optional_ipv4 "Enter a valid IPv4 address." "$(get_public_ipv4)"
   fi
 
   mkdir -p "$NODE_DIR" /var/log/remnanode
@@ -3248,20 +3307,21 @@ remove_stack() {
 
   if confirm "Stop containers and remove directory ${dir}?"; then
     if [ -f "${dir}/docker-compose.yml" ]; then
-      cd "$dir"
+      cd "$dir" || return 1
 
       if [ -f docker-compose.subscription.yml ]; then
-        run_cmd_stream "Stop ${name} compose stack" docker compose -f docker-compose.yml -f docker-compose.subscription.yml down --remove-orphans || true
+        run_cmd_stream "Stop ${name} compose stack" docker compose -f docker-compose.yml -f docker-compose.subscription.yml down --remove-orphans || return 1
       else
-        run_cmd_stream "Stop ${name} compose stack" docker compose down --remove-orphans || true
+        run_cmd_stream "Stop ${name} compose stack" docker compose down --remove-orphans || return 1
       fi
     fi
 
-    rm -rf "$dir"
+    rm -rf "$dir" || return 1
 
     ok "${name} removed."
   else
     warn "${name} removal cancelled by user."
+    return 130
   fi
 }
 
@@ -3281,21 +3341,21 @@ remove_stack_with_volumes() {
 
   note "Full removal of ${name} with Docker volumes."
 
-  ask_delete_confirmation answer
+  ask_delete_confirmation answer || return 130
 
-  [ "$answer" = "DELETE" ] || die "Cancelled."
+  [ "$answer" = "DELETE" ] || { note "Removal cancelled."; return 130; }
 
   if [ -f "${dir}/docker-compose.yml" ]; then
-    cd "$dir"
+    cd "$dir" || return 1
 
     if [ -f docker-compose.subscription.yml ]; then
-      run_cmd_stream "Stop ${name} compose stack and remove volumes" docker compose -f docker-compose.yml -f docker-compose.subscription.yml down -v --remove-orphans || true
+      run_cmd_stream "Stop ${name} compose stack and remove volumes" docker compose -f docker-compose.yml -f docker-compose.subscription.yml down -v --remove-orphans || return 1
     else
-      run_cmd_stream "Stop ${name} compose stack and remove volumes" docker compose down -v --remove-orphans || true
+      run_cmd_stream "Stop ${name} compose stack and remove volumes" docker compose down -v --remove-orphans || return 1
     fi
   fi
 
-  rm -rf "$dir"
+  rm -rf "$dir" || return 1
 
   ok "${name} fully removed."
 }
@@ -3666,10 +3726,7 @@ select_config_profile() {
 
   blank
 
-  ask "Selection profile" choice "1"
-  
-  [ "$choice" -ge 1 ] 2>/dev/null || die "Invalid profile number."
-  [ "$choice" -le "$profile_count" ] 2>/dev/null || die "Invalid profile number."
+  ask_choice "Selection profile" choice 1 "$profile_count" "1"
 
   local selected
 
@@ -3753,10 +3810,7 @@ select_inbound_from_config() {
   
   blank
 
-  ask "Selection inbound" choice "1"
-
-  [ "$choice" -ge 1 ] 2>/dev/null || die "Invalid inbound number."
-  [ "$choice" -le "$inbound_count" ] 2>/dev/null || die "Invalid inbound number."
+  ask_choice "Selection inbound" choice 1 "$inbound_count" "1"
 
   selected=$(jq -n --argjson profileInbounds "$profile_inbounds_json" --argjson config "$config_json" -r "
     def inbound_items:
@@ -3895,6 +3949,41 @@ remove_warp_from_config_profile() {
 
 # MENUS BEGIN
 
+# Call this and its enclosing menus as simple commands, never in if/! or ||.
+# Testing a Bash function's status would disable errexit throughout its body.
+run_menu_action() {
+  local action_status
+  local restore_errexit=0
+  local previous_int_trap
+  [[ "$-" != *e* ]] || restore_errexit=1
+  previous_int_trap="$(trap -p INT)"
+
+  trap ':' INT
+  set +e
+  (
+    set -Eeuo pipefail
+    trap 'exit 130' INT
+    "$@"
+  )
+  action_status=$?
+  if [ -n "$previous_int_trap" ]; then
+    eval "$previous_int_trap"
+  else
+    trap - INT
+  fi
+  if [ "$restore_errexit" = 1 ]; then set -e; fi
+
+  case "$action_status" in
+    0) ;;
+    130) note "Operation cancelled. Returning to the menu." ;;
+    *)
+      warn "Operation stopped (exit ${action_status}). See the error above or ${LOG_FILE}."
+      note "Returning to the menu. Completed steps are preserved; retry the failed operation when ready."
+      ;;
+  esac
+  return 0
+}
+
 show_main_menu() {
   menu_title "Remnawave installer ${SCRIPT_VERSION}"
   menu_item 1 "Install"
@@ -3930,6 +4019,7 @@ show_panel_menu() {
   menu_item 8 "Remove without volumes"
   menu_item 9 "Remove with volumes"
   menu_item 10 "Configure subscription page"
+  menu_item 11 "Create Panel admin"
   menu_item 0 "Back"
   blank
 }
@@ -4046,11 +4136,11 @@ handle_install_menu() {
 
   while true; do
     show_install_menu
-    ask_menu_choice choice
+    ask_menu_choice choice || return 0
     case "$choice" in
-      1) install_panel ;;
-      2) install_node ;;
-      3) install_panel_node ;;
+      1) run_menu_action install_panel ;;
+      2) run_menu_action install_node ;;
+      3) run_menu_action install_panel_node ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4062,18 +4152,19 @@ handle_panel_menu() {
 
   while true; do
     show_panel_menu
-    ask_menu_choice choice
+    ask_menu_choice choice || return 0
     case "$choice" in
-      1) compose_action "$PANEL_DIR" start ;;
-      2) compose_action "$PANEL_DIR" stop ;;
-      3) compose_action "$PANEL_DIR" restart ;;
-      4) update_panel ;;
-      5) compose_action "$PANEL_DIR" status ;;
-      6) compose_action "$PANEL_DIR" logs ;;
-      7) reinstall_panel_keep_config ;;
-      8) remove_panel ;;
-      9) remove_panel_with_volumes ;;
-      10) setup_subscription_page_for_panel ;;
+      1) run_menu_action compose_action "$PANEL_DIR" start ;;
+      2) run_menu_action compose_action "$PANEL_DIR" stop ;;
+      3) run_menu_action compose_action "$PANEL_DIR" restart ;;
+      4) run_menu_action update_panel ;;
+      5) run_menu_action compose_action "$PANEL_DIR" status ;;
+      6) run_menu_action compose_action "$PANEL_DIR" logs ;;
+      7) run_menu_action reinstall_panel_keep_config ;;
+      8) run_menu_action remove_panel ;;
+      9) run_menu_action remove_panel_with_volumes ;;
+      10) run_menu_action setup_subscription_page_for_panel ;;
+      11) run_menu_action create_admin_for_existing_panel ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4085,17 +4176,17 @@ handle_node_menu() {
 
   while true; do
     show_node_menu
-    ask_menu_choice choice
+    ask_menu_choice choice || return 0
     case "$choice" in
-      1) compose_action "$NODE_DIR" start ;;
-      2) compose_action "$NODE_DIR" stop ;;
-      3) compose_action "$NODE_DIR" restart ;;
-      4) update_node ;;
-      5) compose_action "$NODE_DIR" status ;;
-      6) compose_action "$NODE_DIR" logs ;;
-      7) reinstall_node_keep_config ;;
-      8) remove_stack "Node" "$NODE_DIR" ;;
-      9) remove_stack_with_volumes "Node" "$NODE_DIR" ;;
+      1) run_menu_action compose_action "$NODE_DIR" start ;;
+      2) run_menu_action compose_action "$NODE_DIR" stop ;;
+      3) run_menu_action compose_action "$NODE_DIR" restart ;;
+      4) run_menu_action update_node ;;
+      5) run_menu_action compose_action "$NODE_DIR" status ;;
+      6) run_menu_action compose_action "$NODE_DIR" logs ;;
+      7) run_menu_action reinstall_node_keep_config ;;
+      8) run_menu_action remove_stack "Node" "$NODE_DIR" ;;
+      9) run_menu_action remove_stack_with_volumes "Node" "$NODE_DIR" ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4107,11 +4198,11 @@ handle_system_menu() {
 
   while true; do
     show_system_menu
-    ask_menu_choice choice
+    ask_menu_choice choice || return 0
     case "$choice" in
-      1) status_all ;;
-      2) disable_ipv6 ;;
-      3) enable_ipv6 ;;
+      1) run_menu_action status_all ;;
+      2) run_menu_action disable_ipv6 ;;
+      3) run_menu_action enable_ipv6 ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4123,15 +4214,15 @@ handle_warp_menu() {
 
   while true; do
     show_warp_menu
-    ask_menu_choice choice
+    ask_menu_choice choice || return 0
     case "$choice" in
-      1) install_warp_native ;;
-      2) enable_warp_native ;;
-      3) disconnect_warp ;;
-      4) remove_warp ;;
-      5) show_warp_status ;;
-      6) add_warp_to_config_profile ;;
-      7) remove_warp_from_config_profile ;;
+      1) run_menu_action install_warp_native ;;
+      2) run_menu_action enable_warp_native ;;
+      3) run_menu_action disconnect_warp ;;
+      4) run_menu_action remove_warp ;;
+      5) run_menu_action show_warp_status ;;
+      6) run_menu_action add_warp_to_config_profile ;;
+      7) run_menu_action remove_warp_from_config_profile ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4143,14 +4234,14 @@ handle_cert_menu() {
 
   while true; do
     show_cert_menu
-    ask_menu_choice choice
+    ask_menu_choice choice || return 0
     case "$choice" in
-      1) issue_cloudflare_wildcard_cert ;;
-      2) issue_gcore_wildcard_cert ;;
-      3) list_certificates ;;
-      4) renew_certificates_dry_run ;;
-      5) setup_certbot_auto_renew "nginx" || warn "Certbot auto-renew setup reported an error." ;;
-      6) remove_certbot_renew_cron ;;
+      1) run_menu_action issue_cloudflare_wildcard_cert ;;
+      2) run_menu_action issue_gcore_wildcard_cert ;;
+      3) run_menu_action list_certificates ;;
+      4) run_menu_action renew_certificates_dry_run ;;
+      5) run_menu_action setup_certbot_auto_renew "nginx" ;;
+      6) run_menu_action remove_certbot_renew_cron ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4162,10 +4253,10 @@ handle_backup_menu() {
   
   while true; do
     show_backup_menu
-    ask_menu_choice choice
+    ask_menu_choice choice || return 0
     case "$choice" in
-      1) backup_all ;;
-      2) restore_backup ;;
+      1) run_menu_action backup_all ;;
+      2) run_menu_action restore_backup ;;
       0) return 0 ;;
       *) warn "Invalid menu item." ;;
     esac
@@ -4190,7 +4281,7 @@ main() {
   while true; do
     show_main_menu
 
-    ask_menu_choice choice
+    ask_menu_choice choice || return 0
 
     case "$choice" in
       1) handle_install_menu ;;
@@ -4200,7 +4291,7 @@ main() {
       5) handle_warp_menu ;;
       6) handle_cert_menu ;;
       7) handle_backup_menu ;;
-      8) show_support_creator ;;
+      8) run_menu_action show_support_creator ;;
       0) exit 0 ;;
       *) warn "Invalid menu item." ;;
     esac
